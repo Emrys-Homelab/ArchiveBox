@@ -26,6 +26,8 @@ from archivebox.config.common import get_config
 from archivebox.crawls.models import Crawl
 from archivebox.misc.util import filter_queryset_by_uuid_substring, validate_url
 
+from archivebox.core.user_scope import scoped_crawl_queryset
+
 from .auth import API_AUTH_METHODS, authenticated_user_from_request
 
 router = Router(tags=["Crawl Models"], auth=API_AUTH_METHODS)
@@ -109,7 +111,9 @@ def normalize_tag_list(tags: list[str] | None = None, tags_str: str = "") -> lis
 
 @router.get("/crawls", response=list[CrawlSchema], url_name="get_crawls")
 def get_crawls(request: HttpRequest):
-    return Crawl.objects.all().distinct()
+    # A crawl carries its submitted URLs, so the crawl list is scoped like the
+    # snapshot list: your own crawls, nobody else's.
+    return scoped_crawl_queryset(request, Crawl.objects.all()).distinct()
 
 
 @router.post("/crawls", response=CrawlSchema, url_name="create_crawl")
@@ -136,13 +140,14 @@ def create_crawl(request: HttpRequest, data: CrawlCreateSchema):
         config=config,
         status=Crawl.StatusChoices.QUEUED,
         retry_at=timezone.now(),
+        # The crawl's created_by is the snapshot ownership: the token's owner.
         created_by=request.user if isinstance(request.user, User) else None,
     )
     return crawl
 
 
-def get_crawl_by_ref(crawl_id: str):
-    return filter_queryset_by_uuid_substring(Crawl.objects.all(), crawl_id).get()
+def get_crawl_by_ref(crawl_id: str, request: HttpRequest | None = None):
+    return filter_queryset_by_uuid_substring(scoped_crawl_queryset(request, Crawl.objects.all()), crawl_id).get()
 
 
 @router.get("/crawl/{crawl_id}", response=CrawlSchema, url_name="get_crawl")
@@ -150,7 +155,7 @@ def get_crawl(request: HttpRequest, crawl_id: str, as_rss: bool = False, with_sn
     """Get a specific Crawl by id."""
     setattr(request, "with_snapshots", with_snapshots)
     setattr(request, "with_archiveresults", with_archiveresults)
-    crawl = get_crawl_by_ref(crawl_id)
+    crawl = get_crawl_by_ref(crawl_id, request=request)
 
     if crawl and as_rss:
         query = request.GET.copy()
@@ -164,7 +169,7 @@ def get_crawl(request: HttpRequest, crawl_id: str, as_rss: bool = False, with_sn
 def crawl_file(request: HttpRequest, crawl_id: str, path: str):
     # Try to resolve the crawl first; if it doesn't exist, return 404.
     try:
-        crawl = get_crawl_by_ref(crawl_id)
+        crawl = get_crawl_by_ref(crawl_id, request=request)
     except Crawl.DoesNotExist:
         raise HttpError(404, "Crawl not found")
 
@@ -249,7 +254,7 @@ def crawl_file_nested_2(request: HttpRequest, crawl_id: str, folder: str, subfol
 @router.patch("/crawl/{crawl_id}", response=CrawlSchema, url_name="patch_crawl")
 def patch_crawl(request: HttpRequest, crawl_id: str, data: CrawlUpdateSchema):
     """Update a crawl (e.g., set status=sealed to cancel queued work)."""
-    crawl = get_crawl_by_ref(crawl_id)
+    crawl = get_crawl_by_ref(crawl_id, request=request)
     payload = data.dict(exclude_unset=True)
     update_fields = ["modified_at"]
 
@@ -291,7 +296,7 @@ def patch_crawl(request: HttpRequest, crawl_id: str, data: CrawlUpdateSchema):
 
 @router.delete("/crawl/{crawl_id}", response=CrawlDeleteResponseSchema, url_name="delete_crawl")
 def delete_crawl(request: HttpRequest, crawl_id: str):
-    crawl = get_crawl_by_ref(crawl_id)
+    crawl = get_crawl_by_ref(crawl_id, request=request)
     crawl_id_str = str(crawl.id)
     crawl.cancel()
 
@@ -300,7 +305,7 @@ def delete_crawl(request: HttpRequest, crawl_id: str):
 
     with crawl_lifecycle_lock(crawl_id_str):
         run_pending_crawls(crawl_id=crawl_id_str, daemon=False)
-        crawl = get_crawl_by_ref(crawl_id_str)
+        crawl = get_crawl_by_ref(crawl_id_str, request=request)
         snapshot_count = crawl.snapshot_set.count()
         deleted_count, _ = crawl.delete()
     return {

@@ -12,7 +12,8 @@ from ninja.errors import HttpError
 from pydantic import Field, model_validator
 
 from archivebox.misc.util import ansi_to_html
-from archivebox.core.models import SnapshotQuerySet
+from archivebox.core.models import Snapshot, SnapshotQuerySet
+from archivebox.core.user_scope import scoped_snapshot_queryset
 
 
 # router for API that exposes archivebox cli subcommands as REST endpoints
@@ -214,6 +215,9 @@ def cli_update(request: HttpRequest, args: UpdateCommandSchema):
     update_kwargs = snapshot_filter_kwargs(args, default_filter_type=FilterTypeChoices.substring)
     update_kwargs["status"] = status
     update_kwargs["stop_daemon_stack"] = False
+    # Work is queued by a filtered queryset; hand it the caller's scope so a filter
+    # cannot reach another user's captures.
+    update_kwargs["snapshot_scope"] = scoped_snapshot_queryset(request, Snapshot.objects.all())
 
     is_filtered_update = any(
         (update_kwargs.get(key) for key in (*SnapshotQuerySet.FILTER_ARG_KEYS, "resume") if key != "filter_type"),
@@ -286,7 +290,10 @@ def cli_search(request: HttpRequest, args: ListCommandSchema):
     as_csv = search_kwargs.pop("as_csv")
     with_headers = search_kwargs.pop("with_headers")
     try:
-        snapshots = build_snapshot_queryset(**search_kwargs).select_related("crawl", "crawl__created_by")
+        snapshots = scoped_snapshot_queryset(request, build_snapshot_queryset(**search_kwargs)).select_related(
+            "crawl",
+            "crawl__created_by",
+        )
     except ValueError as err:
         raise HttpError(400, str(err)) from err
 
@@ -329,7 +336,9 @@ def cli_remove(request: HttpRequest, args: RemoveCommandSchema):
     timeout_arg = remove_kwargs.pop("timeout")
     timeout = min(float(timeout_arg if timeout_arg is not None else 60.0), 60.0)
     try:
-        snapshots_to_remove = Snapshot.objects.order_by("-created_at").search(**remove_kwargs)
+        # A destructive filter is scoped like a listing: "remove --filter-type=exact
+        # <url>" can only remove the caller's own capture of that URL.
+        snapshots_to_remove = scoped_snapshot_queryset(request, Snapshot.objects.order_by("-created_at")).search(**remove_kwargs)
     except ValueError as err:
         raise HttpError(400, str(err)) from err
 
