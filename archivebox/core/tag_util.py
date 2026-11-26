@@ -13,6 +13,7 @@ from django.urls import reverse
 
 from archivebox.config.common import get_config
 from archivebox.core.models import ArchiveResult, Snapshot, SnapshotTag, Tag
+from archivebox.core.user_scope import scoped_snapshot_queryset
 from archivebox.core.routes_util import build_snapshot_detail_url, build_snapshot_role_output_url
 from archivebox.misc.util import sanitize_html_text
 from archivebox.plugins.discovery import get_snapshot_role_names
@@ -176,13 +177,23 @@ def delete_tag(tag: Tag) -> tuple[int, dict[str, int]]:
     return tag.delete()
 
 
-def export_tag_urls(tag: Tag) -> str:
-    urls = tag.snapshot_set.order_by("-downloaded_at", "-created_at", "-pk").values_list("url", flat=True)
+def export_tag_urls(tag: Tag, request: HttpRequest | None = None) -> str:
+    # Tag membership is not authorisation: a shared tag (``inbox``) is on every
+    # user's captures, so an export is scoped like the list it came from.
+    urls = (
+        scoped_snapshot_queryset(request, tag.snapshot_set.all())
+        .order_by("-downloaded_at", "-created_at", "-pk")
+        .values_list("url", flat=True)
+    )
     return "\n".join(urls)
 
 
-def export_tag_snapshots_jsonl(tag: Tag) -> str:
-    snapshots = tag.snapshot_set.order_by("-downloaded_at", "-created_at", "-pk").prefetch_related("tags")
+def export_tag_snapshots_jsonl(tag: Tag, request: HttpRequest | None = None) -> str:
+    snapshots = (
+        scoped_snapshot_queryset(request, tag.snapshot_set.all())
+        .order_by("-downloaded_at", "-created_at", "-pk")
+        .prefetch_related("tags")
+    )
     return "\n".join(json.dumps(snapshot.to_json()) for snapshot in snapshots)
 
 
@@ -226,8 +237,12 @@ def _build_snapshot_preview_map(
     if not tag_ids or preview_limit <= 0:
         return {}
 
+    scoped_ids = None
+    if request is not None:
+            scoped_ids = scoped_snapshot_queryset(request, Snapshot.objects.all()).values("id")
+
     snapshot_tags = (
-        SnapshotTag.objects.filter(tag_id__in=tag_ids)
+        SnapshotTag.objects.filter(tag_id__in=tag_ids, **({"snapshot_id__in": scoped_ids} if scoped_ids is not None else {}))
         .select_related("snapshot__crawl__created_by")
         .prefetch_related(
             Prefetch(
@@ -306,7 +321,12 @@ def build_tag_cards(
         queryset = queryset[:limit]
 
     tags = list(queryset)
-    if not needs_snapshot_count_annotation:
-        add_snapshot_counts(tags)
+    # Counts are per requester: a shared tag (``inbox``) is on every user's captures
+    # and "5 snapshots" must mean five of *yours*. A plain annotation would count
+    # every row in the table, so it is recomputed against the scoped queryset.
+    add_snapshot_counts(
+        tags,
+        snapshot_queryset=scoped_snapshot_queryset(request, Snapshot.objects.all()) if request is not None else None,
+    )
     preview_map = _build_snapshot_preview_map(tags, request=request, preview_limit=preview_limit)
     return [build_tag_card(tag, snapshot_previews=preview_map.get(tag.pk, [])) for tag in tags]

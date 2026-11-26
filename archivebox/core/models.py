@@ -56,6 +56,12 @@ from archivebox.plugins.discovery import (
     get_plugin_name,
     get_plugins,
 )
+from archivebox.core.user_scope import (
+    USER_TAG_PREFIX,
+    filter_assignable_tag_names,
+    is_user_tag,
+    stamp_snapshot,
+)
 from archivebox.uuid_compat import CompactUUIDField, compact_uuid, uuid7
 from archivebox.workers.models import ACTIVE_STATE_LEASE_SECONDS, RETRY_AT_MAX, ModelWithQueue
 
@@ -74,6 +80,25 @@ class UngroupedSubquery(models.Subquery):
         return []
 
 
+class TagQuerySet(QuerySet):
+    """Queryset behind the default Tag manager (ownership tags excluded)."""
+
+
+class TagManager(models.Manager.from_queryset(TagQuerySet)):  # ty: ignore[unsupported-base]
+    """The user-facing Tag manager.
+
+    ``user-*`` tags are internal ownership records (see ``archivebox.core.user_scope``).
+    Every tag index, picker, autocomplete, inline, changelist and API response goes
+    through the default manager, so excluding them here is what makes them invisible
+    everywhere at once, with no template or serializer able to leak one by omission.
+    ``Tag.all_objects`` is the unfiltered manager; only ``user_scope`` and the
+    backfill migration may use it.
+    """
+
+    def get_queryset(self):
+        return super().get_queryset().exclude(name__istartswith=USER_TAG_PREFIX)
+
+
 class Tag(ModelWithUUID):
     # Keep AutoField for compatibility with main branch migrations
     # Don't use UUIDField here - requires complex FK transformation
@@ -89,15 +114,26 @@ class Tag(ModelWithUUID):
     modified_at = models.DateTimeField(auto_now=True)
     name = models.CharField(unique=True, blank=False, max_length=100)
 
+    #: Default, user-facing manager: ``user-*`` ownership tags are invisible through it.
+    objects = TagManager()
+    #: Unfiltered manager for the ownership records themselves (``archivebox.core.user_scope``).
+    all_objects = models.Manager()
+
     @classmethod
     def get_or_create_by_name(cls, name: str, *, defaults: Mapping[str, Any] | None = None) -> tuple["Tag", bool]:
-        tag = cls.objects.filter(name__iexact=name).first()
+        # ONE REFUSAL POINT for every name -> Tag path (forms, API, JSONL import, tag
+        # editors). An ownership tag is written only by user_scope.stamp_snapshot, so a
+        # user cannot mint ``user-<someone>`` and cannot hand themselves another user's
+        # capture by re-tagging their own.
+        if is_user_tag(name):
+            raise ValueError(f'"{name}" is reserved: {USER_TAG_PREFIX}* tags are internal ownership records')
+        tag = cls.all_objects.filter(name__iexact=name).first()
         if tag:
             return tag, False
         try:
-            return cls.objects.create(name=name, **(defaults or {})), True
+            return cls.all_objects.create(name=name, **(defaults or {})), True
         except IntegrityError:
-            tag = cls.objects.filter(name__iexact=name).first()
+            tag = cls.all_objects.filter(name__iexact=name).first()
             if tag is None:
                 raise
             return tag, False
@@ -3059,12 +3095,32 @@ class Snapshot(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelW
         return int(self.output_size or 0)
 
     def save_tags(self, tags: Iterable[str] = (), *, created_by: Any = None) -> None:
+        """Replace the visible tag set, preserving the ownership tag.
+
+        THE ONE CHOKE POINT FOR OWNERSHIP. Every snapshot-creating path ends up here:
+        ``Snapshot.save()`` calls it for a new row (crawls, the API, imports, the
+        runner, discovered links), and the admin/API tag editors call it on every
+        later edit. So this is where ``user-<name>`` is stamped, and why it is
+        preserved rather than replaced: an ownership tag records who asked for the
+        capture, not what a later tag edit thinks of it.
+        """
         from archivebox.core.tag_util import get_or_create_tag
 
-        tag_ids = {get_or_create_tag(tag, created_by=created_by)[0].pk for tag in tags if tag.strip()}
-        existing_tag_ids = set(SnapshotTag.objects.filter(snapshot_id=self.pk).values_list("tag_id", flat=True))
-        self.remove_tag_ids(existing_tag_ids - tag_ids)
-        self.add_tag_ids(tag_ids - existing_tag_ids)
+        # A reserved name is not a user tag: silently dropped here (the picker never
+        # offers one) while get_or_create_tag raises for a caller that tries by name.
+        tag_names = filter_assignable_tag_names(tags)
+        tag_ids = {get_or_create_tag(tag, created_by=created_by)[0].pk for tag in tag_names}
+        existing = dict(SnapshotTag.objects.filter(snapshot_id=self.pk).values_list("tag_id", "tag__name"))
+        existing_tag_ids = set(existing)
+        owner_tag_ids = {tag_id for tag_id, name in existing.items() if is_user_tag(name)}
+        if not owner_tag_ids:
+            owner_tag = stamp_snapshot(self)
+            if owner_tag is not None:
+                owner_tag_ids = {owner_tag.pk}
+        # remove_tag_ids() would otherwise delete the ownership row: it is not in the
+        # submitted tag list because no form ever shows it.
+        self.remove_tag_ids(existing_tag_ids - tag_ids - owner_tag_ids)
+        self.add_tag_ids((tag_ids - existing_tag_ids) | (owner_tag_ids - existing_tag_ids))
 
     def finalize_output_metadata(self) -> None:
         """
