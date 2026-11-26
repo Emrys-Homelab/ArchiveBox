@@ -1,0 +1,24 @@
+{% if USER_SCOPE.can_see_all or USER_SCOPE.enabled %}
+<div id="user-scope-banner" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 14px;padding:9px 14px;border-radius:10px;border:1px solid {% if USER_SCOPE.see_all %}#f59e0b{% else %}#cbd5e1{% endif %};background:{% if USER_SCOPE.see_all %}#fffbeb{% else %}#f8fafc{% endif %};color:#0f172a;font-size:13px;">
+    {% if USER_SCOPE.see_all %}
+        <strong>Every user's captures are visible.</strong>
+        <span>Per-user isolation is switched off for this session until you switch it back.</span>
+    {% else %}
+        <strong>Showing only your captures.</strong>
+        <span>Tag <code style="background:#e2e8f0;padding:1px 5px;border-radius:4px;">{{ USER_SCOPE.tag }}</code> &middot; other users' items are not listed, searched or openable by URL.</span>
+    {% endif %}
+    {% if USER_SCOPE.can_see_all %}
+        <form method="post" action="{% url 'user-scope-see-all' %}" style="margin:0 0 0 auto;">
+            {% csrf_token %}
+            <input type="hidden" name="next" value="{{ request.get_full_path }}">
+            {% if USER_SCOPE.see_all %}
+                <input type="hidden" name="see_all" value="0">
+                <button type="submit" style="cursor:pointer;padding:4px 10px;border-radius:7px;border:1px solid #cbd5e1;background:#fff;font-size:12px;font-weight:600;">Back to only mine</button>
+            {% else %}
+                <input type="hidden" name="see_all" value="1">
+                <button type="submit" style="cursor:pointer;padding:4px 10px;border-radius:7px;border:1px solid #cbd5e1;background:#fff;font-size:12px;font-weight:600;">See every user</button>
+            {% endif %}
+        </form>
+    {% endif %}
+</div>
+{% endif %}

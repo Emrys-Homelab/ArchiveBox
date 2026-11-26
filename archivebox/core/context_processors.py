@@ -15,7 +15,12 @@ def get_static_cache_key() -> str:
 
 
 def archivebox_globals(request):
+    from archivebox.core.user_scope import scope_summary
+
     return {
         "VERSION": VERSION,
         "STATIC_CACHE_KEY": get_static_cache_key(),
+        # Which user's items this request can see, for the banner in admin/base.html.
+        # The filter itself is enforced in the querysets, never here.
+        "USER_SCOPE": scope_summary(request),
     }

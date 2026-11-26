@@ -21,10 +21,11 @@ from django.contrib.auth.mixins import UserPassesTestMixin
 from django.contrib.sessions.models import Session
 from django.contrib.sessions.backends.db import SessionStore
 from django.core import signing
-from django.core.exceptions import ValidationError
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.db.models import Case, IntegerField, Q, Value, When
 from django.http import Http404, HttpRequest, HttpResponse, HttpResponseForbidden, QueryDict
 from django.shortcuts import redirect, render
+from django.urls import reverse
 from django.utils.decorators import method_decorator
 from django.utils.html import format_html, format_html_join
 from django.utils.cache import patch_cache_control, patch_vary_headers
@@ -62,6 +63,11 @@ from archivebox.core.permissions import (
     filter_personas_by_permissions,
     is_admin_user,
     public_snapshots_queryset,
+)
+from archivebox.core.user_scope import (
+    require_snapshot_access,
+    scoped_snapshot_queryset,
+    set_see_everything,
 )
 from archivebox.core.routes_util import (
     build_admin_url,
@@ -287,6 +293,9 @@ class SnapshotReplayAuthView(View):
         snapshot = _find_snapshot_by_ref(str(request.GET.get("snapshot") or ""), request=request)
         if not snapshot:
             raise Http404
+        # A replay grant is a credential for one snapshot; it is never minted for a
+        # snapshot the requesting admin does not own.
+        require_snapshot_access(request, snapshot)
 
         # Signed JSON is readable, not encrypted. Store the privileged session
         # reference only server-side; replay credentials carry an opaque key to
@@ -442,6 +451,10 @@ class SnapshotView(View):
                     except Snapshot.DoesNotExist:
                         snapshots = self.find_snapshots_for_id(slug, request=request)
                         snapshot = snapshots.get()
+                    # A snapshot that belongs to another user answers 404, exactly like
+                    # one that does not exist - never the private-snapshot login
+                    # redirect, which would confirm that it exists.
+                    require_snapshot_access(request, snapshot)
                     request.archivebox_cache_policy = "public" if snapshot.permissions == PERMISSIONS_PUBLIC else "private"
                     if not can_view_snapshot(request, snapshot):
                         return _private_snapshot_auth_redirect(request, snapshot, archivefile or "index.html")
@@ -672,6 +685,11 @@ class SnapshotPathView(View):
         snapshots_qs = discoverable_snapshots_queryset(request, Snapshot.objects.select_related("crawl", "crawl__created_by"))
         if snapshot_id:
             snapshot = _find_snapshot_by_ref(snapshot_id, request=request)
+            if snapshot:
+                # The username segment of this URL is presentational: the lookup above is
+                # by id alone, so ownership has to be enforced here or
+                # /<any-username>/<date>/<domain>/<someone-else's-uuid>/ would open.
+                require_snapshot_access(request, snapshot)
             if snapshot and not can_view_snapshot(request, snapshot):
                 return _private_snapshot_auth_redirect(request, snapshot, path or "index.html")
         else:
@@ -1283,6 +1301,7 @@ class SnapshotHostView(View):
 
         if not snapshot:
             raise Http404
+        require_snapshot_access(request, snapshot)
         if path == "_auth":
             return _replay_auth_response(request, snapshot)
         if not can_view_snapshot(request, snapshot) and not _has_replay_cookie(request, snapshot):
@@ -1305,6 +1324,7 @@ class SnapshotReplayView(View):
         snapshot = _find_snapshot_by_ref(snapshot_id, request=request)
         if not snapshot:
             raise Http404
+        require_snapshot_access(request, snapshot)
         if path == "_auth":
             return _replay_auth_response(request, snapshot)
         if not can_view_snapshot(request, snapshot) and not _has_replay_cookie(request, snapshot):
@@ -1383,7 +1403,8 @@ class PublicIndexView(ListView):
         # computed for every skipped row.
         start = (page_number - 1) * page_size
         page_ids = list(
-            Snapshot.objects.filter(config__PERMISSIONS=PERMISSIONS_PUBLIC)
+            scoped_snapshot_queryset(self.request, Snapshot.objects.all())
+            .filter(config__PERMISSIONS=PERMISSIONS_PUBLIC)
             .order_by(*self.ordering, "id")
             .values_list("id", flat=True)[start : start + page_size + 1],
         )
@@ -1506,7 +1527,7 @@ class PublicIndexView(ListView):
 
     def get_queryset(self, **kwargs):
         qs = (
-            public_snapshots_queryset(super().get_queryset(**kwargs))
+            public_snapshots_queryset(super().get_queryset(**kwargs), request=self.request)
             .select_related("crawl__created_by")
             .only(*self._base_public_snapshot_fields())
         )
@@ -1896,6 +1917,36 @@ class WebAddView(AddView):
         snapshot = Snapshot.from_json({"url": add_url, "tags": form.cleaned_data.get("tag", "")}, overrides={"crawl": crawl})
         assert snapshot is not None
         return redirect(build_snapshot_detail_url(snapshot.archive_path_from_db, request=request))
+
+
+class UserScopeSeeAllView(View):
+    """The one deliberate way to read captures that belong to other users.
+
+    Per-user isolation is not a query parameter. Seeing every user's items is a
+    separate action: a POST from the admin banner, superuser only, recorded in the
+    session and shown in the banner for as long as it is on. It is never the default,
+    not even for a superuser - the operator's own view is the same as everyone
+    else's - and there is no GET form of it.
+    """
+
+    http_method_names = ["post"]
+
+    def post(self, request):
+        user = request.user
+        if not (user.is_authenticated and user.is_active and user.is_superuser):
+            raise PermissionDenied("Only a superuser may switch to the cross-user view")
+
+        enable = str(request.POST.get("see_all") or "").strip() == "1"
+        set_see_everything(request, enable)
+        if enable:
+            messages.warning(request, "Showing every user's captures. This is recorded in your session until you switch back.")
+        else:
+            messages.success(request, "Showing only your own captures again.")
+
+        next_url = str(request.POST.get("next") or "").strip()
+        if not next_url.startswith("/") or next_url.startswith("//"):
+            next_url = reverse("admin:core_snapshot_changelist")
+        return redirect(next_url)
 
 
 class HealthCheckView(View):

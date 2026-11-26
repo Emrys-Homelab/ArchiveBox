@@ -23,6 +23,7 @@ from archivebox.core.views import (
     AddView,
     WebAddView,
     HealthCheckView,
+    UserScopeSeeAllView,
 )
 from archivebox.progressmonitor.views import live_progress_view
 from archivebox.search.views import public_snapshot_search_stream_view
@@ -62,6 +63,9 @@ urlpatterns = [
     path("admin/core/snapshot/add/", RedirectView.as_view(url="/add/")),
     path("admin/core/snapshot/replay-auth/", SnapshotReplayAuthView.as_view(), name="snapshot-replay-auth"),
     path("add/", AddView.as_view(), name="add"),
+    # POST-only toggle for the deliberate cross-user view (superuser only; see
+    # core/views.py UserScopeSeeAllView and core/user_scope.py).
+    path("user-scope/see-all/", UserScopeSeeAllView.as_view(), name="user-scope-see-all"),
     # ``query_string=True`` preserves the ``?next=…`` param that Django's
     # auth/login mixins append, so e.g. ``UserPassesTestMixin`` redirecting
     # an unauthenticated ``/add`` visitor to ``/accounts/login/?next=/add/``

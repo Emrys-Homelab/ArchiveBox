@@ -36,6 +36,19 @@ def get_snapshot_permissions(snapshot) -> str:
 
 
 def can_view_snapshot(request: HttpRequest, snapshot) -> bool:
+    """Whether this request may read this snapshot at all.
+
+    OWNERSHIP FIRST, AND IT IS NOT NEGOTIABLE BY PERMISSIONS OR BY STAFF STATUS. A
+    snapshot belongs to one user (its ``user-<name>`` tag); ``is_admin_user`` is
+    checked afterwards and only relaxes the per-snapshot public/unlisted/private
+    setting *within* a user's own collection. Without this line an admin - which is
+    every account that can log into the UI - would read every collection.
+    """
+    from archivebox.core.user_scope import can_access_snapshot
+
+    if not can_access_snapshot(request, snapshot):
+        return False
+
     permissions = get_snapshot_permissions(snapshot)
     unlisted_ok = permissions == PERMISSIONS_UNLISTED and not getattr(snapshot, "matched_by_prefix", False)
     return permissions == PERMISSIONS_PUBLIC or unlisted_ok or is_admin_user(request)
@@ -57,15 +70,30 @@ def filter_snapshots_by_permissions(queryset: QuerySet, *, direct: bool = False,
     return queryset.filter(permissions__in=allowed)
 
 
-def public_snapshots_queryset(queryset: QuerySet) -> QuerySet:
-    return filter_snapshots_by_permissions(queryset, direct=False)
+def public_snapshots_queryset(queryset: QuerySet, request: HttpRequest | None = None) -> QuerySet:
+    """Public visibility, inside the caller's own collection.
+
+    ``request`` is optional only for local/export callers. Every web and API caller
+    passes it: without a user the scope is empty, so an anonymous visitor sees no
+    captures at all - a per-user collection has no public index.
+    """
+    from archivebox.core.user_scope import scoped_snapshot_queryset
+
+    return filter_snapshots_by_permissions(scoped_snapshot_queryset(request, queryset), direct=False)
 
 
 def discoverable_snapshots_queryset(request: HttpRequest | None, queryset: QuerySet) -> QuerySet:
     # Incomplete references and URL lookups must not reveal unlisted/private captures.
     # Local exports have no request and retain captures of every permission level.
-    return queryset if request is None or is_admin_user(request) else public_snapshots_queryset(queryset)
+    from archivebox.core.user_scope import scoped_snapshot_queryset
+
+    queryset = scoped_snapshot_queryset(request, queryset)
+    return queryset if request is None or is_admin_user(request) else public_snapshots_queryset(queryset, request=request)
 
 
 def direct_snapshots_queryset(request: HttpRequest, queryset: QuerySet) -> QuerySet:
+    """Direct-link visibility: ownership, then unlisted/private, never staff bypass of ownership."""
+    from archivebox.core.user_scope import scoped_snapshot_queryset
+
+    queryset = scoped_snapshot_queryset(request, queryset)
     return queryset if is_admin_user(request) else filter_snapshots_by_permissions(queryset, direct=True)
