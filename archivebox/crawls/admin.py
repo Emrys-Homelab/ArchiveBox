@@ -31,6 +31,7 @@ from archivebox.core.permissions import (
     normalize_permissions,
 )
 from archivebox.core.routes_util import build_snapshot_detail_url, build_snapshot_role_output_url
+from archivebox.core.user_scope import scoped_crawl_queryset, scoped_snapshot_queryset
 from archivebox.core.widgets import TagEditorWidget, URLFiltersWidget
 from archivebox.crawls.models import Crawl, CrawlSchedule
 from archivebox.misc.paginators import AcceleratedPaginator
@@ -788,8 +789,7 @@ class CrawlAdmin(ConfigEditorMixin, BaseModelAdmin):
     def get_queryset(self, request):
         """Keep joins page-local while computing per-row snapshot counts in the page query."""
         queryset = (
-            super()
-            .get_queryset(request)
+            scoped_crawl_queryset(request, super().get_queryset(request))
             .prefetch_related(
                 "created_by",
                 "persona",
@@ -1156,8 +1156,8 @@ class CrawlAdmin(ConfigEditorMixin, BaseModelAdmin):
         if request.method != "POST":
             return HttpResponseNotAllowed(["POST"])
 
-        crawl = get_object_or_404(Crawl, pk=object_id)
-        snapshot = get_object_or_404(Snapshot, pk=snapshot_id, crawl=crawl)
+        crawl = get_object_or_404(scoped_crawl_queryset(request, Crawl.objects.all()), pk=object_id)
+        snapshot = get_object_or_404(scoped_snapshot_queryset(request, Snapshot.objects.all()), pk=snapshot_id, crawl=crawl)
 
         if snapshot.status == Snapshot.StatusChoices.STARTED:
             snapshot.cancel_running_hooks()
@@ -1176,8 +1176,8 @@ class CrawlAdmin(ConfigEditorMixin, BaseModelAdmin):
         if request.method != "POST":
             return HttpResponseNotAllowed(["POST"])
 
-        crawl = get_object_or_404(Crawl, pk=object_id)
-        snapshot = get_object_or_404(Snapshot, pk=snapshot_id, crawl=crawl)
+        crawl = get_object_or_404(scoped_crawl_queryset(request, Crawl.objects.all()), pk=object_id)
+        snapshot = get_object_or_404(scoped_snapshot_queryset(request, Snapshot.objects.all()), pk=snapshot_id, crawl=crawl)
         result = crawl.exclude_domain(snapshot.url)
         return JsonResponse(
             {
@@ -1194,7 +1194,7 @@ class CrawlAdmin(ConfigEditorMixin, BaseModelAdmin):
         if permissions not in PERMISSIONS_VALUES:
             return HttpResponseBadRequest("Invalid permissions value")
 
-        crawl = get_object_or_404(Crawl, pk=object_id)
+        crawl = get_object_or_404(scoped_crawl_queryset(request, Crawl.objects.all()), pk=object_id)
         self.update_crawl_permissions(Crawl.objects.filter(pk=crawl.pk), permissions)
         icon, label, fg, bg = PERMISSIONS_META[permissions]
         return JsonResponse({"permissions": permissions, "icon": icon, "label": label, "fg": fg, "bg": bg})
@@ -1297,8 +1297,7 @@ class CrawlScheduleAdmin(BaseModelAdmin):
     def get_queryset(self, request):
         self.request = request
         return (
-            super()
-            .get_queryset(request)
+            scoped_crawl_queryset(request, super().get_queryset(request))
             .select_related("created_by", "template")
             .annotate(
                 crawl_count=Count("crawl", distinct=True),

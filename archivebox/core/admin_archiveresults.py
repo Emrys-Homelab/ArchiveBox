@@ -571,7 +571,9 @@ class ArchiveResultAdmin(BaseModelAdmin):
             try:
                 queryset = self.get_queryset(request).filter(pk__in=selected)
                 if not queryset.exists():
-                    snapshot = Snapshot.objects.filter(pk=request.GET.get("snapshot")).first()
+                    from archivebox.core.user_scope import scoped_snapshot_queryset
+
+                    snapshot = scoped_snapshot_queryset(request, Snapshot.objects.all()).filter(pk=request.GET.get("snapshot")).first()
                     return redirect(build_snapshot_detail_url(snapshot.archive_path_from_db, request=request) if snapshot else request.path)
             except (ValidationError, ValueError):
                 return redirect(request.path)
@@ -584,7 +586,9 @@ class ArchiveResultAdmin(BaseModelAdmin):
             request.GET.clear()
             request.META["QUERY_STRING"] = ""
             try:
-                handoff_snapshot = Snapshot.objects.filter(pk=handoff_snapshot).first()
+                from archivebox.core.user_scope import scoped_snapshot_queryset
+
+                handoff_snapshot = scoped_snapshot_queryset(request, Snapshot.objects.all()).filter(pk=handoff_snapshot).first()
             except (ValidationError, ValueError):
                 handoff_snapshot = None
         saved_list_per_page = self.list_per_page
@@ -604,6 +608,16 @@ class ArchiveResultAdmin(BaseModelAdmin):
             self.list_per_page = saved_list_per_page
 
     def get_queryset(self, request):
+        # Same forced scope as the snapshot changelist: an archive result is visible
+        # only when its snapshot belongs to the requesting user.
+        return self._scoped_queryset(request)
+
+    def _scoped_queryset(self, request):
+        from archivebox.core.user_scope import scoped_archiveresult_queryset
+
+        return scoped_archiveresult_queryset(request, self._unscoped_queryset(request))
+
+    def _unscoped_queryset(self, request):
         ordering = request.GET.get("o")
         ordering_fields = set()
         if ordering:

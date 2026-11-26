@@ -942,6 +942,7 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
             List of newly created Snapshot objects
         """
         from archivebox.core.models import Snapshot, Tag
+        from archivebox.core.user_scope import crawl_owner_username, owned_snapshot_queryset
         from archivebox.config.common import get_config
 
         if self.status == self.StatusChoices.SEALED:
@@ -949,6 +950,7 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
         created_snapshots = []
         tags_by_name: dict[str, Tag] = {}
         server_config = get_config()
+        owner_username = crawl_owner_username(self)
 
         for line in self.urls.splitlines():
             if not line.strip():
@@ -989,7 +991,10 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
             # still deduplicates discovered children and ordinary adds.
             refresh_scheduled_seed = self.schedule_id is not None and self.max_depth > 0 and depth == 0
             # /über and /%C3%BCber are one URL: dedupe across both spellings.
-            if only_new_urls and not refresh_scheduled_seed and Snapshot.objects.filter(url__in=equivalent_urls(url)).exists():
+            # ONLY_NEW is per owner: another user's capture of the same URL must not
+            # make this add a no-op, or a second user could never archive a URL the
+            # first one already had.
+            if only_new_urls and not refresh_scheduled_seed and owned_snapshot_queryset(owner_username, Snapshot.objects).filter(url__in=equivalent_urls(url)).exists():
                 continue
 
             # Skip if depth exceeds max_depth
@@ -1095,6 +1100,7 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
     ) -> list["Snapshot"]:
         """Create child snapshots from discovered URL records after filtering and deduping once."""
         from archivebox.core.models import Snapshot, SnapshotTag, Tag
+        from archivebox.core.user_scope import crawl_owner_username, filter_assignable_tag_names, owned_snapshot_queryset
         from archivebox.config.common import get_config
 
         if self.status == self.StatusChoices.SEALED:
@@ -1166,12 +1172,12 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
                 update_fields.append("bookmarked_at")
             if update_fields:
                 snapshot.save(update_fields=[*update_fields, "modified_at"])
-            tag_names = {
-                *self.parse_tag_names(
+            tag_names = filter_assignable_tag_names(
+                self.parse_tag_names(
                     str(record.get("tags") or ""),
                     pattern=self._config_value(config, "TAG_SEPARATOR_PATTERN", r"[,]"),
                 ),
-            }
+            )
             if tag_names:
                 tag_ids = [Tag.get_or_create_by_name(tag_name)[0].pk for tag_name in tag_names]
                 snapshot.add_tag_ids(tag_ids)
@@ -1180,7 +1186,7 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
         # Child discoveries must retain global ONLY_NEW even in scheduled crawls.
         refresh_scheduled_seed = self.schedule_id is not None and self.max_depth > 0 and parent_snapshot is None and depth == 0
         only_new_urls = bool(self._config_value(config, "ONLY_NEW", True)) and not refresh_scheduled_seed
-        existing_scope = Snapshot.objects if only_new_urls else self.snapshot_set
+        existing_scope = owned_snapshot_queryset(crawl_owner_username(self), Snapshot.objects) if only_new_urls else self.snapshot_set
         existing_uris = {iri_to_uri(url) for url in existing_scope.filter(url__in=lookup_urls).values_list("url", flat=True)}
         urls = [url for url in deduped_records.keys() if iri_to_uri(url) not in existing_uris]
         remaining = self.remaining_snapshot_capacity()

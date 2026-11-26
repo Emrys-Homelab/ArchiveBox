@@ -403,7 +403,9 @@ def public_snapshot_search_stream_view(request):
     query = (request.GET.get("q") or "").strip()
     search_mode = get_search_mode(request.GET.get("search_mode"), config=config)
     search_url = request.GET.get("search_url") or request.get_full_path()
-    base_queryset = public_snapshots_queryset(Snapshot.objects.all())
+    # Ownership first: the stream may only publish IDs the request could already
+    # see, so a cached result set cannot widen a later page.
+    base_queryset = public_snapshots_queryset(Snapshot.objects.all(), request=request)
 
     return snapshot_search_stream_response(
         query,

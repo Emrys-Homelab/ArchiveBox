@@ -137,10 +137,18 @@ def live_progress_view(request, *, authorized_snapshot=None):
         crawl_scope = Crawl.objects.all()
         snapshot_scope = Snapshot.objects.all()
         archiveresult_scope = ArchiveResult.objects.all()
-        if is_admin and not request.user.is_superuser:
-            crawl_scope = crawl_scope.filter(created_by=request.user)
-            snapshot_scope = snapshot_scope.filter(crawl__created_by=request.user)
-            archiveresult_scope = archiveresult_scope.filter(snapshot__crawl__created_by=request.user)
+        # Per-user isolation applies to the header counters as well: the same forced
+        # scope as every list, widened only by the superuser's deliberate see-all.
+        if request.user.is_authenticated:
+            from archivebox.core.user_scope import (
+                scoped_archiveresult_queryset,
+                scoped_crawl_queryset,
+                scoped_snapshot_queryset,
+            )
+
+            crawl_scope = scoped_crawl_queryset(request, crawl_scope)
+            snapshot_scope = scoped_snapshot_queryset(request, snapshot_scope)
+            archiveresult_scope = scoped_archiveresult_queryset(request, archiveresult_scope)
         # Header badges (queued, active, workers, throughput) always describe the
         # admin's whole collection; only the tree below follows the page's scope.
         # Guests on a public snapshot page only ever see that snapshot.

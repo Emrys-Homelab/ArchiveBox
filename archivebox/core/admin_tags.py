@@ -13,7 +13,8 @@ from django.utils.html import format_html
 from django.utils.safestring import mark_safe
 
 from archivebox.base_models.admin import BaseModelAdmin
-from archivebox.core.models import ArchiveResult, SnapshotTag, Tag
+from archivebox.core.models import ArchiveResult, Snapshot, SnapshotTag, Tag
+from archivebox.core.user_scope import scoped_snapshot_queryset
 from archivebox.core.tag_util import (
     TAG_HAS_SNAPSHOTS_CHOICES,
     TAG_SORT_CHOICES,
@@ -53,9 +54,15 @@ class TagAdminForm(forms.ModelForm):
         }
 
     def clean_name(self):
+        from archivebox.core.user_scope import is_user_tag
+
         name = (self.cleaned_data.get("name") or "").strip()
         if not name:
             raise forms.ValidationError("Tag name is required.")
+        if is_user_tag(name):
+            # Ownership tags are written at capture time and hidden everywhere; a
+            # hand-made one would either be inert or name another user's collection.
+            raise forms.ValidationError('Tags starting with "user-" are reserved for per-user ownership.')
         return name
 
 
@@ -111,10 +118,17 @@ class TagAdmin(BaseModelAdmin):
         ),
     )
 
+    def get_queryset(self, request: HttpRequest):
+        # The default manager already excludes user-* ownership tags; keep the
+        # request so the per-tag snapshot cards can apply the ownership scope.
+        self.request = request
+        return super().get_queryset(request)
+
     def get_fieldsets(self, request: HttpRequest, obj: Tag | None = None):
         return self.fieldsets if obj else self.add_fieldsets
 
     def changelist_view(self, request: HttpRequest, extra_context=None):
+        self.request = request
         query = (request.GET.get("q") or "").strip()
         sort = normalize_tag_sort((request.GET.get("sort") or "created_desc").strip())
         created_by = normalize_created_by_filter((request.GET.get("created_by") or "").strip())
@@ -150,6 +164,7 @@ class TagAdmin(BaseModelAdmin):
         return TemplateResponse(request, self.change_list_template, context)
 
     def render_change_form(self, request, context, add=False, change=False, form_url="", obj=None):
+        self.request = request
         current_name = (request.POST.get("name") or "").strip()
         if not current_name and obj:
             current_name = obj.name
@@ -193,8 +208,11 @@ class TagAdmin(BaseModelAdmin):
 
     @admin.display(description="Snapshots")
     def snapshots(self, tag: Tag):
+        # The recent-snapshot cards on a tag page are the requester's snapshots: a
+        # shared tag is on every user's captures, and these cards show URLs/titles.
         snapshots = (
-            tag.snapshot_set.select_related("crawl__created_by")
+            scoped_snapshot_queryset(getattr(self, "request", None), tag.snapshot_set.all())
+            .select_related("crawl__created_by")
             .prefetch_related(
                 Prefetch(
                     "archiveresult_set",
@@ -213,7 +231,7 @@ class TagAdmin(BaseModelAdmin):
             )
             .order_by("-downloaded_at", "-created_at", "-pk")[:10]
         )
-        total_count = tag.snapshot_set.count()
+        total_count = scoped_snapshot_queryset(getattr(self, "request", None), tag.snapshot_set.all()).count()
         if not snapshots:
             return mark_safe(
                 f'<p style="margin:0;color:#64748b;">No snapshots use this tag yet. '
@@ -259,7 +277,7 @@ class TagAdmin(BaseModelAdmin):
     def num_snapshots(self, tag: Tag):
         count = tag.__dict__.get("num_snapshots")
         if count is None:
-            count = tag.snapshot_set.count()
+            count = scoped_snapshot_queryset(getattr(self, "request", None), tag.snapshot_set.all()).count()
         return format_html(
             '<a href="/admin/core/snapshot/?tags__id__exact={}">{} total</a>',
             tag.id,

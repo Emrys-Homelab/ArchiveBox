@@ -6,7 +6,7 @@ from html import escape
 from typing import Any
 
 from django.contrib import admin, messages
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.urls import path, reverse
 from django.shortcuts import get_object_or_404, redirect
 from django.http import JsonResponse, HttpResponseBadRequest, HttpResponseNotAllowed, Http404
@@ -36,6 +36,11 @@ from archivebox.core.routes_util import (
     get_snapshot_output_anchor,
 )
 from archivebox.core.tag_util import get_or_create_tag
+from archivebox.core.user_scope import (
+    filter_assignable_tag_names,
+    is_user_tag,
+    scoped_snapshot_queryset,
+)
 from archivebox.core.templatetags.core_tags import snapshot_thumbnail, snapshot_url_text
 from archivebox.plugins.hooks import discover_hooks
 from archivebox.plugins.discovery import get_plugin_icon, get_plugin_icon_sprite, get_plugin_list_icon, get_snapshot_role_names
@@ -606,7 +611,9 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
 
     def preview_view(self, request, object_id, plugin, filename):
         """Serve a saved image output from the authenticated admin origin."""
-        snapshot = get_object_or_404(Snapshot, pk=object_id)
+        # Scoped, not a bare pk lookup: these are custom admin URLs outside the
+        # changelist and would otherwise reach another user's snapshot by id.
+        snapshot = get_object_or_404(scoped_snapshot_queryset(request, Snapshot.objects.all()), pk=object_id)
         if not self.has_view_or_change_permission(request, snapshot):
             raise PermissionDenied
         result = snapshot.archiveresult_set.filter(plugin=plugin, status=ArchiveResult.StatusChoices.SUCCEEDED).first()
@@ -635,7 +642,9 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
         if permissions not in dict(PERMISSIONS_CHOICES):
             return HttpResponseBadRequest("Invalid permissions value")
 
-        snapshot = get_object_or_404(Snapshot, pk=object_id)
+        # Scoped, not a bare pk lookup: these are custom admin URLs outside the
+        # changelist and would otherwise reach another user's snapshot by id.
+        snapshot = get_object_or_404(scoped_snapshot_queryset(request, Snapshot.objects.all()), pk=object_id)
         config = dict(snapshot.config or {})
         config["PERMISSIONS"] = permissions
 
@@ -677,7 +686,9 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
         return updated
 
     def redo_failed_view(self, request, object_id):
-        snapshot = get_object_or_404(Snapshot, pk=object_id)
+        # Scoped, not a bare pk lookup: these are custom admin URLs outside the
+        # changelist and would otherwise reach another user's snapshot by id.
+        snapshot = get_object_or_404(scoped_snapshot_queryset(request, Snapshot.objects.all()), pk=object_id)
 
         if request.method == "POST":
             retried = snapshot.retry_failed_archiveresults()
@@ -693,6 +704,25 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
                 )
 
         return redirect(snapshot.admin_change_url)
+
+    def get_object(self, request, object_id, from_field=None):
+        """404 for a snapshot that exists but belongs to another user.
+
+        Django's default answer for an object outside ``get_queryset()`` is a
+        redirect to the changelist ("does not exist"). That is indistinguishable
+        from a bad id, but the contract here is that a direct URL to a snapshot
+        that is not yours answers 404 - the same as one that does not exist - so
+        the row's existence never leaks through a status code.
+        """
+        obj = super().get_object(request, object_id, from_field)
+        if obj is None and object_id:
+            try:
+                exists = Snapshot.objects.filter(pk=object_id).exists()
+            except (ValidationError, ValueError, TypeError):
+                exists = False
+            if exists:
+                raise Http404("Snapshot not found")
+        return obj
 
     def get_queryset(self, request):
         self.request = request
@@ -731,6 +761,10 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
             )
 
         qs = super().get_queryset(request)
+        # THE FORCED FILTER, SERVER-SIDE. This is the snapshot changelist, its search,
+        # its filters, the change form (a foreign snapshot raises 404 here) and every
+        # bulk action that operates on the queryset - one place, no query parameter.
+        qs = scoped_snapshot_queryset(request, qs)
         if is_change_view:
             qs = qs.select_related("crawl__created_by").defer("notes")
         else:
@@ -1470,7 +1504,9 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
         # on the resulting crawl so existing snapshots don't cause the crawl to
         # seal immediately with zero new snapshots (the default ONLY_NEW=True
         # would skip any URLs that have ever been archived before).
-        crawl, _ = add(urls=urls, bg=True, config={"ONLY_NEW": False})
+        # Attribute the new crawl to the operator who asked for it: the crawl's
+        # created_by is what stamps user-<name> on the snapshots it creates.
+        crawl, _ = add(urls=urls, bg=True, config={"ONLY_NEW": False}, created_by_id=request.user.pk)
 
         messages.success(
             request,
@@ -1519,6 +1555,16 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
             return
 
         tag_names = [name.strip() for name in tags_str.split(",") if name.strip()]
+        reserved = [name for name in tag_names if is_user_tag(name)]
+        tag_names = filter_assignable_tag_names(tag_names)
+        if reserved:
+            messages.warning(
+                request,
+                f"Ignored reserved ownership tag(s): {', '.join(reserved)}. They are assigned automatically.",
+            )
+        if not tag_names:
+            messages.warning(request, "No tags specified.")
+            return
         tags = []
         for name in tag_names:
             tag, _ = get_or_create_tag(
