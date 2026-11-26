@@ -1,0 +1,398 @@
+From 93f2fb1f333f999d209dad0debab56731db99b98 Mon Sep 17 00:00:00 2001
+From: homelab <homelab@emrys.dev>
+Date: Thu, 26 Nov 2026 02:56:29 -0600
+Subject: [PATCH 4/7] api: scope every snapshot endpoint, attribute to the
+ token's owner
+
+The API's owner is the API token's owner: django-ninja resolves the bearer
+token to APIToken.created_by, so the crawl created by POST /core/snapshots
+carries that user and the snapshot is stamped from it. A crawl id belonging
+to someone else is 404, and reuse-by-URL is per owner.
+
+List, detail, RSS, archive results, crawls, tag exports and the legacy
+/api/v1/cli/* commands are all filtered by the same scope, so no filter,
+search or id can reach another user's capture.
+---
+ archivebox/api/v1_cli.py    | 15 +++++--
+ archivebox/api/v1_core.py   | 83 +++++++++++++++++++++++++++----------
+ archivebox/api/v1_crawls.py | 21 ++++++----
+ 3 files changed, 85 insertions(+), 34 deletions(-)
+
+diff --git a/archivebox/api/v1_cli.py b/archivebox/api/v1_cli.py
+index e87424a05..8ff722336 100644
+--- a/archivebox/api/v1_cli.py
++++ b/archivebox/api/v1_cli.py
+@@ -12,7 +12,8 @@ from ninja.errors import HttpError
+ from pydantic import Field, model_validator
+ 
+ from archivebox.misc.util import ansi_to_html
+-from archivebox.core.models import SnapshotQuerySet
++from archivebox.core.models import Snapshot, SnapshotQuerySet
++from archivebox.core.user_scope import scoped_snapshot_queryset
+ 
+ 
+ # router for API that exposes archivebox cli subcommands as REST endpoints
+@@ -214,6 +215,9 @@ def cli_update(request: HttpRequest, args: UpdateCommandSchema):
+     update_kwargs = snapshot_filter_kwargs(args, default_filter_type=FilterTypeChoices.substring)
+     update_kwargs["status"] = status
+     update_kwargs["stop_daemon_stack"] = False
++    # Work is queued by a filtered queryset; hand it the caller's scope so a filter
++    # cannot reach another user's captures.
++    update_kwargs["snapshot_scope"] = scoped_snapshot_queryset(request, Snapshot.objects.all())
+ 
+     is_filtered_update = any(
+         (update_kwargs.get(key) for key in (*SnapshotQuerySet.FILTER_ARG_KEYS, "resume") if key != "filter_type"),
+@@ -286,7 +290,10 @@ def cli_search(request: HttpRequest, args: ListCommandSchema):
+     as_csv = search_kwargs.pop("as_csv")
+     with_headers = search_kwargs.pop("with_headers")
+     try:
+-        snapshots = build_snapshot_queryset(**search_kwargs).select_related("crawl", "crawl__created_by")
++        snapshots = scoped_snapshot_queryset(request, build_snapshot_queryset(**search_kwargs)).select_related(
++            "crawl",
++            "crawl__created_by",
++        )
+     except ValueError as err:
+         raise HttpError(400, str(err)) from err
+ 
+@@ -329,7 +336,9 @@ def cli_remove(request: HttpRequest, args: RemoveCommandSchema):
+     timeout_arg = remove_kwargs.pop("timeout")
+     timeout = min(float(timeout_arg if timeout_arg is not None else 60.0), 60.0)
+     try:
+-        snapshots_to_remove = Snapshot.objects.order_by("-created_at").search(**remove_kwargs)
++        # A destructive filter is scoped like a listing: "remove --filter-type=exact
++        # <url>" can only remove the caller's own capture of that URL.
++        snapshots_to_remove = scoped_snapshot_queryset(request, Snapshot.objects.order_by("-created_at")).search(**remove_kwargs)
+     except ValueError as err:
+         raise HttpError(400, str(err)) from err
+ 
+diff --git a/archivebox/api/v1_core.py b/archivebox/api/v1_core.py
+index e219a8714..d9a1687fb 100644
+--- a/archivebox/api/v1_core.py
++++ b/archivebox/api/v1_core.py
+@@ -32,6 +32,13 @@ from ninja.errors import HttpError
+ 
+ from archivebox.core.models import Snapshot, ArchiveResult, Tag
+ from archivebox.core.permissions import can_view_snapshot, public_snapshots_queryset
++from archivebox.core.user_scope import (
++    crawl_owner_username,
++    owned_snapshot_queryset,
++    scoped_archiveresult_queryset,
++    scoped_crawl_queryset,
++    scoped_snapshot_queryset,
++)
+ from archivebox.api.auth import authenticated_user_from_request
+ from archivebox.config.common import get_config
+ from archivebox.core.routes_util import build_snapshot_detail_url, build_web_url
+@@ -235,7 +242,8 @@ def _with_archiveresult_processes(queryset):
+ def get_archiveresults(request: HttpRequest, filters: Query[ArchiveResultFilterSchema]):
+     """List all ArchiveResult entries matching these filters."""
+     queryset = filters.filter(
+-        _with_archiveresult_processes(ArchiveResult.objects.all()).prefetch_related("snapshot__tags"),
++        # An archive result is only visible through its snapshot's owner.
++        scoped_archiveresult_queryset(request, _with_archiveresult_processes(ArchiveResult.objects.all())).prefetch_related("snapshot__tags"),
+     )
+     if filters.search or filters.snapshot_tag:
+         return queryset.distinct()
+@@ -263,11 +271,14 @@ def _uuid_ref_query(field_name: str, ref: str) -> Q:
+ @router.get("/archiveresult/{archiveresult_id}", response=ArchiveResultSchema, url_name="get_archiveresult")
+ def get_archiveresult(request: HttpRequest, archiveresult_id: str):
+     """Get a specific ArchiveResult by id."""
+-    return (
+-        _with_archiveresult_processes(ArchiveResult.objects.all())
+-        .prefetch_related("snapshot__tags")
+-        .get(_uuid_ref_query("id", archiveresult_id))
+-    )
++    try:
++        return (
++            scoped_archiveresult_queryset(request, _with_archiveresult_processes(ArchiveResult.objects.all()))
++            .prefetch_related("snapshot__tags")
++            .get(_uuid_ref_query("id", archiveresult_id))
++        )
++    except ArchiveResult.DoesNotExist as err:
++        raise HttpError(404, "ArchiveResult not found") from err
+ 
+ 
+ def _normalize_uploaded_archiveresult_plugin(plugin: str) -> str:
+@@ -373,10 +384,13 @@ def _summarize_archiveresult_output_files(output_files: dict[str, dict[str, Any]
+     return manifest.total_size, ",".join(manifest.mimetypes)
+ 
+ 
+-def _get_snapshot_by_ref(snapshot_id: str):
++def _get_snapshot_by_ref(snapshot_id: str, request: HttpRequest | None = None):
+     # Snapshot metadata needs the owner/persona, not a potentially multi-MB
+     # crawl intake. Keep polling an individual snapshot independent of its size.
+-    queryset = Snapshot.objects.select_related("crawl__created_by", "crawl__persona").defer("crawl__urls")
++    queryset = scoped_snapshot_queryset(request, Snapshot.objects.all()).select_related(
++        "crawl__created_by",
++        "crawl__persona",
++    ).defer("crawl__urls")
+     try:
+         try:
+             full_id = UUID(snapshot_id)
+@@ -549,7 +563,7 @@ def create_archiveresult(
+     output_json: str = Form(""),
+ ):
+     """Create or update an ArchiveResult with one or more output files."""
+-    snapshot = _get_snapshot_by_ref(snapshot_id)
++    snapshot = _get_snapshot_by_ref(snapshot_id, request=request)
+     plugin_name = _normalize_uploaded_archiveresult_plugin(plugin)
+     normalized_status = ArchiveResult.normalize_status(status)
+     parsed_output_json = _parse_archiveresult_output_json(output_json)
+@@ -782,6 +796,7 @@ def _parse_rss_before(before: str | None) -> datetime:
+ 
+ 
+ def _filter_snapshots_for_rss(
++    request: HttpRequest | None = None,
+     *,
+     crawl_id: str = "",
+     created_by: str = "",
+@@ -791,7 +806,8 @@ def _filter_snapshots_for_rss(
+     limit = max(1, min(int(limit or 50), 500))
+     before_dt = _parse_rss_before(before)
+     queryset = (
+-        Snapshot.objects.select_related("crawl__created_by")
++        scoped_snapshot_queryset(request, Snapshot.objects.all())
++        .select_related("crawl__created_by")
+         .prefetch_related("tags")
+         .only(
+             "id",
+@@ -908,8 +924,14 @@ def get_snapshots(request: HttpRequest, filters: Query[SnapshotFilterSchema], wi
+     """List all Snapshot entries matching these filters."""
+     setattr(request, "with_archiveresults", with_archiveresults)
+     try:
++        # THE FORCED FILTER FOR THE API. Scope first, then the caller's filters and
++        # search - so ?tag=, ?search= and ?status= can only narrow this user's own
++        # collection, and a tag filter cannot be used to enumerate someone else's.
+         queryset = filter_snapshots_by_status(
+-            Snapshot.objects.select_related("crawl__created_by", "crawl__persona").defer("crawl__urls"),
++            scoped_snapshot_queryset(
++                request,
++                Snapshot.objects.select_related("crawl__created_by", "crawl__persona").defer("crawl__urls"),
++            ),
+             filters.status,
+         )
+     except ValueError as err:
+@@ -945,6 +967,7 @@ def get_snapshots_rss(
+ ):
+     """Return matching snapshots as an RSS feed, newest first."""
+     snapshots = _filter_snapshots_for_rss(
++        request=request,
+         crawl_id=crawl_id,
+         created_by=created_by,
+         limit=limit,
+@@ -957,7 +980,7 @@ def get_snapshots_rss(
+ def get_snapshot(request: HttpRequest, snapshot_id: str, with_archiveresults: bool = True):
+     """Get a specific Snapshot by id."""
+     setattr(request, "with_archiveresults", with_archiveresults)
+-    return _get_snapshot_by_ref(snapshot_id)
++    return _get_snapshot_by_ref(snapshot_id, request=request)
+ 
+ 
+ @router.get("/snapshot/{snapshot_id}/screencast.jpg", auth=None, url_name="snapshot_screencast")
+@@ -1015,10 +1038,17 @@ def create_snapshot(request: HttpRequest, data: SnapshotCreateSchema):
+         raise HttpError(400, "depth must be between 0 and 4")
+ 
+     if data.crawl_id:
+-        crawl = get_crawl_by_ref(data.crawl_id)
++        # The actor may only add to a crawl they own: reusing someone else's crawl
++        # id would file this capture under that user and hide it from the caller.
++        crawl = get_crawl_by_ref(data.crawl_id, request=request)
+         crawl_tags = normalize_tag_list(crawl.tags_str.split(","))
+         tags = tags or crawl_tags
+     else:
++        # THE API'S OWNER IS THE TOKEN'S OWNER. django-ninja's token auth assigns
++        # request.user from APIToken.created_by (archivebox/api/auth.py), so a token
++        # minted by A stamps user-A even when the HTTP request carries no session.
++        # The crawl's created_by is what user_scope reads at snapshot creation, so
++        # this one field is the whole attribution.
+         crawl = Crawl.objects.create(
+             urls=data.url,
+             max_depth=max(data.depth, 0),
+@@ -1038,8 +1068,11 @@ def create_snapshot(request: HttpRequest, data: SnapshotCreateSchema):
+         # It must honor the runner's deduplication policy, even if it arrives
+         # before the runner has processed that crawl. Report the actual owner
+         # so clients never mistake a reused capture for one they just created.
++        # Reuse is per owner. Returning another user's capture here would both leak
++        # its metadata in the response and make the caller's own archive miss the URL.
+         snapshot = (
+-            Snapshot.objects.filter(url__in=equivalent_urls(data.url))
++            owned_snapshot_queryset(crawl_owner_username(crawl), Snapshot.objects)
++            .filter(url__in=equivalent_urls(data.url))
+             .exclude(status=Snapshot.DELETING_STATE)
+             .order_by("-created_at")
+             .first()
+@@ -1087,7 +1120,7 @@ def create_snapshot(request: HttpRequest, data: SnapshotCreateSchema):
+ @router.patch("/snapshot/{snapshot_id}", response=SnapshotSchema, url_name="patch_snapshot")
+ def patch_snapshot(request: HttpRequest, snapshot_id: str, data: SnapshotUpdateSchema):
+     """Update a snapshot (e.g., set status=sealed to cancel queued work)."""
+-    snapshot = _get_snapshot_by_ref(snapshot_id)
++    snapshot = _get_snapshot_by_ref(snapshot_id, request=request)
+     crawl_id = str(snapshot.crawl_id)
+ 
+     payload = data.dict(exclude_unset=True)
+@@ -1111,7 +1144,8 @@ def patch_snapshot(request: HttpRequest, snapshot_id: str, data: SnapshotUpdateS
+         raise HttpError(400, f"Invalid action: {action}")
+ 
+     with crawl_lifecycle_lock(crawl_id):
+-        snapshot = _get_snapshot_by_ref(snapshot_id)
++        # Re-resolve inside the lock, still scoped: the id came from the caller.
++        snapshot = _get_snapshot_by_ref(snapshot_id, request=request)
+         if "status" in payload:
+             try:
+                 payload["status"] = normalize_snapshot_status(payload["status"])
+@@ -1327,12 +1361,12 @@ class TagSnapshotResponseSchema(Schema):
+     tag_name: str
+ 
+ 
+-def _get_snapshot_for_tag_edit(snapshot_ref: str) -> Snapshot:
++def _get_snapshot_for_tag_edit(snapshot_ref: str, request: HttpRequest | None = None) -> Snapshot:
+     snapshot_ref = str(snapshot_ref or "").strip().lower()
+     if not snapshot_ref:
+         raise HttpError(400, "Snapshot id is required")
+ 
+-    snapshot_qs = Snapshot.objects.only("id")
++    snapshot_qs = scoped_snapshot_queryset(request, Snapshot.objects.all()).only("id")
+     is_full_uuid = len(snapshot_ref.replace("-", "")) == 32 and all(char in "0123456789abcdef-" for char in snapshot_ref)
+     if is_full_uuid:
+         try:
+@@ -1411,7 +1445,7 @@ def tags_autocomplete(request: HttpRequest, q: str = ""):
+ 
+     public_only = not request.user.is_authenticated and not request.__dict__.get("_api_token")
+     queryset = get_matching_tags(q)
+-    public_snapshots = public_snapshots_queryset(Snapshot.objects.all())
++    public_snapshots = public_snapshots_queryset(Snapshot.objects.all(), request=request)
+     if public_only:
+         queryset = queryset.filter(snapshot_set__id__in=public_snapshots.values("id")).distinct()
+     tags = list(queryset[: 50 if not q else 20])
+@@ -1479,7 +1513,7 @@ def tag_urls_export(request: HttpRequest, tag_id: int):
+     except Tag.DoesNotExist as err:
+         raise HttpError(404, "Tag not found") from err
+ 
+-    response = HttpResponse(export_tag_urls(tag), content_type="text/plain; charset=utf-8")
++    response = HttpResponse(export_tag_urls(tag, request=request), content_type="text/plain; charset=utf-8")
+     response["Content-Disposition"] = f'attachment; filename="tag-{tag.slug}-urls.txt"'
+     return response
+ 
+@@ -1491,7 +1525,7 @@ def tag_snapshots_export(request: HttpRequest, tag_id: int):
+     except Tag.DoesNotExist as err:
+         raise HttpError(404, "Tag not found") from err
+ 
+-    response = HttpResponse(export_tag_snapshots_jsonl(tag), content_type="application/x-ndjson; charset=utf-8")
++    response = HttpResponse(export_tag_snapshots_jsonl(tag, request=request), content_type="application/x-ndjson; charset=utf-8")
+     response["Content-Disposition"] = f'attachment; filename="tag-{tag.slug}-snapshots.jsonl"'
+     return response
+ 
+@@ -1499,11 +1533,14 @@ def tag_snapshots_export(request: HttpRequest, tag_id: int):
+ @router.post("/tags/add-to-snapshot/", response=TagSnapshotResponseSchema, url_name="tags_add_to_snapshot")
+ def tags_add_to_snapshot(request: HttpRequest, data: TagSnapshotRequestSchema):
+     """Add a tag to a snapshot. Creates the tag if it doesn't exist."""
+-    snapshot = _get_snapshot_for_tag_edit(data.snapshot_id)
++    snapshot = _get_snapshot_for_tag_edit(data.snapshot_id, request=request)
+ 
+     # Get or create the tag
+     if data.tag_name:
+         try:
++            # Reserved user-* names raise inside get_or_create_tag -> 400. A caller
++            # cannot name someone else's ownership tag onto their own capture, and
++            # cannot replace their own: it is written at creation, not by hand.
+             tag, _ = get_or_create_tag(
+                 data.tag_name,
+                 created_by=request.user if request.user.is_authenticated else None,
+@@ -1530,7 +1567,7 @@ def tags_add_to_snapshot(request: HttpRequest, data: TagSnapshotRequestSchema):
+ @router.post("/tags/remove-from-snapshot/", response=TagSnapshotResponseSchema, url_name="tags_remove_from_snapshot")
+ def tags_remove_from_snapshot(request: HttpRequest, data: TagSnapshotRequestSchema):
+     """Remove a tag from a snapshot."""
+-    snapshot = _get_snapshot_for_tag_edit(data.snapshot_id)
++    snapshot = _get_snapshot_for_tag_edit(data.snapshot_id, request=request)
+ 
+     # Get the tag
+     if data.tag_id:
+diff --git a/archivebox/api/v1_crawls.py b/archivebox/api/v1_crawls.py
+index 23ff54e16..1c1f3c433 100644
+--- a/archivebox/api/v1_crawls.py
++++ b/archivebox/api/v1_crawls.py
+@@ -26,6 +26,8 @@ from archivebox.config.common import get_config
+ from archivebox.crawls.models import Crawl
+ from archivebox.misc.util import filter_queryset_by_uuid_substring, validate_url
+ 
++from archivebox.core.user_scope import scoped_crawl_queryset
++
+ from .auth import API_AUTH_METHODS, authenticated_user_from_request
+ 
+ router = Router(tags=["Crawl Models"], auth=API_AUTH_METHODS)
+@@ -109,7 +111,9 @@ def normalize_tag_list(tags: list[str] | None = None, tags_str: str = "") -> lis
+ 
+ @router.get("/crawls", response=list[CrawlSchema], url_name="get_crawls")
+ def get_crawls(request: HttpRequest):
+-    return Crawl.objects.all().distinct()
++    # A crawl carries its submitted URLs, so the crawl list is scoped like the
++    # snapshot list: your own crawls, nobody else's.
++    return scoped_crawl_queryset(request, Crawl.objects.all()).distinct()
+ 
+ 
+ @router.post("/crawls", response=CrawlSchema, url_name="create_crawl")
+@@ -136,13 +140,14 @@ def create_crawl(request: HttpRequest, data: CrawlCreateSchema):
+         config=config,
+         status=Crawl.StatusChoices.QUEUED,
+         retry_at=timezone.now(),
++        # The crawl's created_by is the snapshot ownership: the token's owner.
+         created_by=request.user if isinstance(request.user, User) else None,
+     )
+     return crawl
+ 
+ 
+-def get_crawl_by_ref(crawl_id: str):
+-    return filter_queryset_by_uuid_substring(Crawl.objects.all(), crawl_id).get()
++def get_crawl_by_ref(crawl_id: str, request: HttpRequest | None = None):
++    return filter_queryset_by_uuid_substring(scoped_crawl_queryset(request, Crawl.objects.all()), crawl_id).get()
+ 
+ 
+ @router.get("/crawl/{crawl_id}", response=CrawlSchema, url_name="get_crawl")
+@@ -150,7 +155,7 @@ def get_crawl(request: HttpRequest, crawl_id: str, as_rss: bool = False, with_sn
+     """Get a specific Crawl by id."""
+     setattr(request, "with_snapshots", with_snapshots)
+     setattr(request, "with_archiveresults", with_archiveresults)
+-    crawl = get_crawl_by_ref(crawl_id)
++    crawl = get_crawl_by_ref(crawl_id, request=request)
+ 
+     if crawl and as_rss:
+         query = request.GET.copy()
+@@ -164,7 +169,7 @@ def get_crawl(request: HttpRequest, crawl_id: str, as_rss: bool = False, with_sn
+ def crawl_file(request: HttpRequest, crawl_id: str, path: str):
+     # Try to resolve the crawl first; if it doesn't exist, return 404.
+     try:
+-        crawl = get_crawl_by_ref(crawl_id)
++        crawl = get_crawl_by_ref(crawl_id, request=request)
+     except Crawl.DoesNotExist:
+         raise HttpError(404, "Crawl not found")
+ 
+@@ -249,7 +254,7 @@ def crawl_file_nested_2(request: HttpRequest, crawl_id: str, folder: str, subfol
+ @router.patch("/crawl/{crawl_id}", response=CrawlSchema, url_name="patch_crawl")
+ def patch_crawl(request: HttpRequest, crawl_id: str, data: CrawlUpdateSchema):
+     """Update a crawl (e.g., set status=sealed to cancel queued work)."""
+-    crawl = get_crawl_by_ref(crawl_id)
++    crawl = get_crawl_by_ref(crawl_id, request=request)
+     payload = data.dict(exclude_unset=True)
+     update_fields = ["modified_at"]
+ 
+@@ -291,7 +296,7 @@ def patch_crawl(request: HttpRequest, crawl_id: str, data: CrawlUpdateSchema):
+ 
+ @router.delete("/crawl/{crawl_id}", response=CrawlDeleteResponseSchema, url_name="delete_crawl")
+ def delete_crawl(request: HttpRequest, crawl_id: str):
+-    crawl = get_crawl_by_ref(crawl_id)
++    crawl = get_crawl_by_ref(crawl_id, request=request)
+     crawl_id_str = str(crawl.id)
+     crawl.cancel()
+ 
+@@ -300,7 +305,7 @@ def delete_crawl(request: HttpRequest, crawl_id: str):
+ 
+     with crawl_lifecycle_lock(crawl_id_str):
+         run_pending_crawls(crawl_id=crawl_id_str, daemon=False)
+-        crawl = get_crawl_by_ref(crawl_id_str)
++        crawl = get_crawl_by_ref(crawl_id_str, request=request)
+         snapshot_count = crawl.snapshot_set.count()
+         deleted_count, _ = crawl.delete()
+     return {
+-- 
+2.53.0
+

@@ -1,0 +1,302 @@
+From 3cb3302fdbefc2cae18159f3348d772a2336de2e Mon Sep 17 00:00:00 2001
+From: homelab <homelab@emrys.dev>
+Date: Thu, 26 Nov 2026 02:56:29 -0600
+Subject: [PATCH 2/7] core: enforce the ownership filter server-side, 404 on
+ direct access
+
+can_view_snapshot() checks ownership before permissions, so every view that
+already asked it now answers for the right user. The direct-URL views
+(SnapshotView, SnapshotPathView, the replay hosts, the replay auth handoff)
+call require_snapshot_access() explicitly, because a snapshot that is not
+yours must answer 404 rather than the private-snapshot login redirect.
+
+Seeing other users' captures is a POST-only, superuser-only session toggle
+(/user-scope/see-all/); the admin banner states the active scope. Superusers
+are not exempt by default.
+---
+ archivebox/core/context_processors.py         |  5 ++
+ archivebox/core/permissions.py                | 34 ++++++++++-
+ archivebox/core/urls.py                       |  4 ++
+ archivebox/core/views.py                      | 57 ++++++++++++++++++-
+ archivebox/templates/admin/base.html          |  2 +
+ .../templates/admin/user_scope_banner.html    | 24 ++++++++
+ 6 files changed, 120 insertions(+), 6 deletions(-)
+ create mode 100644 archivebox/templates/admin/user_scope_banner.html
+
+diff --git a/archivebox/core/context_processors.py b/archivebox/core/context_processors.py
+index 09b550995..402c2395c 100644
+--- a/archivebox/core/context_processors.py
++++ b/archivebox/core/context_processors.py
+@@ -15,7 +15,12 @@ def get_static_cache_key() -> str:
+ 
+ 
+ def archivebox_globals(request):
++    from archivebox.core.user_scope import scope_summary
++
+     return {
+         "VERSION": VERSION,
+         "STATIC_CACHE_KEY": get_static_cache_key(),
++        # Which user's items this request can see, for the banner in admin/base.html.
++        # The filter itself is enforced in the querysets, never here.
++        "USER_SCOPE": scope_summary(request),
+     }
+diff --git a/archivebox/core/permissions.py b/archivebox/core/permissions.py
+index 3213a1939..6764899e3 100644
+--- a/archivebox/core/permissions.py
++++ b/archivebox/core/permissions.py
+@@ -36,6 +36,19 @@ def get_snapshot_permissions(snapshot) -> str:
+ 
+ 
+ def can_view_snapshot(request: HttpRequest, snapshot) -> bool:
++    """Whether this request may read this snapshot at all.
++
++    OWNERSHIP FIRST, AND IT IS NOT NEGOTIABLE BY PERMISSIONS OR BY STAFF STATUS. A
++    snapshot belongs to one user (its ``user-<name>`` tag); ``is_admin_user`` is
++    checked afterwards and only relaxes the per-snapshot public/unlisted/private
++    setting *within* a user's own collection. Without this line an admin - which is
++    every account that can log into the UI - would read every collection.
++    """
++    from archivebox.core.user_scope import can_access_snapshot
++
++    if not can_access_snapshot(request, snapshot):
++        return False
++
+     permissions = get_snapshot_permissions(snapshot)
+     unlisted_ok = permissions == PERMISSIONS_UNLISTED and not getattr(snapshot, "matched_by_prefix", False)
+     return permissions == PERMISSIONS_PUBLIC or unlisted_ok or is_admin_user(request)
+@@ -57,15 +70,30 @@ def filter_snapshots_by_permissions(queryset: QuerySet, *, direct: bool = False,
+     return queryset.filter(permissions__in=allowed)
+ 
+ 
+-def public_snapshots_queryset(queryset: QuerySet) -> QuerySet:
+-    return filter_snapshots_by_permissions(queryset, direct=False)
++def public_snapshots_queryset(queryset: QuerySet, request: HttpRequest | None = None) -> QuerySet:
++    """Public visibility, inside the caller's own collection.
++
++    ``request`` is optional only for local/export callers. Every web and API caller
++    passes it: without a user the scope is empty, so an anonymous visitor sees no
++    captures at all - a per-user collection has no public index.
++    """
++    from archivebox.core.user_scope import scoped_snapshot_queryset
++
++    return filter_snapshots_by_permissions(scoped_snapshot_queryset(request, queryset), direct=False)
+ 
+ 
+ def discoverable_snapshots_queryset(request: HttpRequest | None, queryset: QuerySet) -> QuerySet:
+     # Incomplete references and URL lookups must not reveal unlisted/private captures.
+     # Local exports have no request and retain captures of every permission level.
+-    return queryset if request is None or is_admin_user(request) else public_snapshots_queryset(queryset)
++    from archivebox.core.user_scope import scoped_snapshot_queryset
++
++    queryset = scoped_snapshot_queryset(request, queryset)
++    return queryset if request is None or is_admin_user(request) else public_snapshots_queryset(queryset, request=request)
+ 
+ 
+ def direct_snapshots_queryset(request: HttpRequest, queryset: QuerySet) -> QuerySet:
++    """Direct-link visibility: ownership, then unlisted/private, never staff bypass of ownership."""
++    from archivebox.core.user_scope import scoped_snapshot_queryset
++
++    queryset = scoped_snapshot_queryset(request, queryset)
+     return queryset if is_admin_user(request) else filter_snapshots_by_permissions(queryset, direct=True)
+diff --git a/archivebox/core/urls.py b/archivebox/core/urls.py
+index ed8f92011..68cefaa77 100644
+--- a/archivebox/core/urls.py
++++ b/archivebox/core/urls.py
+@@ -23,6 +23,7 @@ from archivebox.core.views import (
+     AddView,
+     WebAddView,
+     HealthCheckView,
++    UserScopeSeeAllView,
+ )
+ from archivebox.progressmonitor.views import live_progress_view
+ from archivebox.search.views import public_snapshot_search_stream_view
+@@ -62,6 +63,9 @@ urlpatterns = [
+     path("admin/core/snapshot/add/", RedirectView.as_view(url="/add/")),
+     path("admin/core/snapshot/replay-auth/", SnapshotReplayAuthView.as_view(), name="snapshot-replay-auth"),
+     path("add/", AddView.as_view(), name="add"),
++    # POST-only toggle for the deliberate cross-user view (superuser only; see
++    # core/views.py UserScopeSeeAllView and core/user_scope.py).
++    path("user-scope/see-all/", UserScopeSeeAllView.as_view(), name="user-scope-see-all"),
+     # ``query_string=True`` preserves the ``?next=…`` param that Django's
+     # auth/login mixins append, so e.g. ``UserPassesTestMixin`` redirecting
+     # an unauthenticated ``/add`` visitor to ``/accounts/login/?next=/add/``
+diff --git a/archivebox/core/views.py b/archivebox/core/views.py
+index a61f8b644..e04ff3a91 100644
+--- a/archivebox/core/views.py
++++ b/archivebox/core/views.py
+@@ -21,10 +21,11 @@ from django.contrib.auth.mixins import UserPassesTestMixin
+ from django.contrib.sessions.models import Session
+ from django.contrib.sessions.backends.db import SessionStore
+ from django.core import signing
+-from django.core.exceptions import ValidationError
++from django.core.exceptions import PermissionDenied, ValidationError
+ from django.db.models import Case, IntegerField, Q, Value, When
+ from django.http import Http404, HttpRequest, HttpResponse, HttpResponseForbidden, QueryDict
+ from django.shortcuts import redirect, render
++from django.urls import reverse
+ from django.utils.decorators import method_decorator
+ from django.utils.html import format_html, format_html_join
+ from django.utils.cache import patch_cache_control, patch_vary_headers
+@@ -63,6 +64,11 @@ from archivebox.core.permissions import (
+     is_admin_user,
+     public_snapshots_queryset,
+ )
++from archivebox.core.user_scope import (
++    require_snapshot_access,
++    scoped_snapshot_queryset,
++    set_see_everything,
++)
+ from archivebox.core.routes_util import (
+     build_admin_url,
+     build_snapshot_detail_url,
+@@ -287,6 +293,9 @@ class SnapshotReplayAuthView(View):
+         snapshot = _find_snapshot_by_ref(str(request.GET.get("snapshot") or ""), request=request)
+         if not snapshot:
+             raise Http404
++        # A replay grant is a credential for one snapshot; it is never minted for a
++        # snapshot the requesting admin does not own.
++        require_snapshot_access(request, snapshot)
+ 
+         # Signed JSON is readable, not encrypted. Store the privileged session
+         # reference only server-side; replay credentials carry an opaque key to
+@@ -442,6 +451,10 @@ class SnapshotView(View):
+                     except Snapshot.DoesNotExist:
+                         snapshots = self.find_snapshots_for_id(slug, request=request)
+                         snapshot = snapshots.get()
++                    # A snapshot that belongs to another user answers 404, exactly like
++                    # one that does not exist - never the private-snapshot login
++                    # redirect, which would confirm that it exists.
++                    require_snapshot_access(request, snapshot)
+                     request.archivebox_cache_policy = "public" if snapshot.permissions == PERMISSIONS_PUBLIC else "private"
+                     if not can_view_snapshot(request, snapshot):
+                         return _private_snapshot_auth_redirect(request, snapshot, archivefile or "index.html")
+@@ -672,6 +685,11 @@ class SnapshotPathView(View):
+         snapshots_qs = discoverable_snapshots_queryset(request, Snapshot.objects.select_related("crawl", "crawl__created_by"))
+         if snapshot_id:
+             snapshot = _find_snapshot_by_ref(snapshot_id, request=request)
++            if snapshot:
++                # The username segment of this URL is presentational: the lookup above is
++                # by id alone, so ownership has to be enforced here or
++                # /<any-username>/<date>/<domain>/<someone-else's-uuid>/ would open.
++                require_snapshot_access(request, snapshot)
+             if snapshot and not can_view_snapshot(request, snapshot):
+                 return _private_snapshot_auth_redirect(request, snapshot, path or "index.html")
+         else:
+@@ -1283,6 +1301,7 @@ class SnapshotHostView(View):
+ 
+         if not snapshot:
+             raise Http404
++        require_snapshot_access(request, snapshot)
+         if path == "_auth":
+             return _replay_auth_response(request, snapshot)
+         if not can_view_snapshot(request, snapshot) and not _has_replay_cookie(request, snapshot):
+@@ -1305,6 +1324,7 @@ class SnapshotReplayView(View):
+         snapshot = _find_snapshot_by_ref(snapshot_id, request=request)
+         if not snapshot:
+             raise Http404
++        require_snapshot_access(request, snapshot)
+         if path == "_auth":
+             return _replay_auth_response(request, snapshot)
+         if not can_view_snapshot(request, snapshot) and not _has_replay_cookie(request, snapshot):
+@@ -1383,7 +1403,8 @@ class PublicIndexView(ListView):
+         # computed for every skipped row.
+         start = (page_number - 1) * page_size
+         page_ids = list(
+-            Snapshot.objects.filter(config__PERMISSIONS=PERMISSIONS_PUBLIC)
++            scoped_snapshot_queryset(self.request, Snapshot.objects.all())
++            .filter(config__PERMISSIONS=PERMISSIONS_PUBLIC)
+             .order_by(*self.ordering, "id")
+             .values_list("id", flat=True)[start : start + page_size + 1],
+         )
+@@ -1506,7 +1527,7 @@ class PublicIndexView(ListView):
+ 
+     def get_queryset(self, **kwargs):
+         qs = (
+-            public_snapshots_queryset(super().get_queryset(**kwargs))
++            public_snapshots_queryset(super().get_queryset(**kwargs), request=self.request)
+             .select_related("crawl__created_by")
+             .only(*self._base_public_snapshot_fields())
+         )
+@@ -1898,6 +1919,36 @@ class WebAddView(AddView):
+         return redirect(build_snapshot_detail_url(snapshot.archive_path_from_db, request=request))
+ 
+ 
++class UserScopeSeeAllView(View):
++    """The one deliberate way to read captures that belong to other users.
++
++    Per-user isolation is not a query parameter. Seeing every user's items is a
++    separate action: a POST from the admin banner, superuser only, recorded in the
++    session and shown in the banner for as long as it is on. It is never the default,
++    not even for a superuser - the operator's own view is the same as everyone
++    else's - and there is no GET form of it.
++    """
++
++    http_method_names = ["post"]
++
++    def post(self, request):
++        user = request.user
++        if not (user.is_authenticated and user.is_active and user.is_superuser):
++            raise PermissionDenied("Only a superuser may switch to the cross-user view")
++
++        enable = str(request.POST.get("see_all") or "").strip() == "1"
++        set_see_everything(request, enable)
++        if enable:
++            messages.warning(request, "Showing every user's captures. This is recorded in your session until you switch back.")
++        else:
++            messages.success(request, "Showing only your own captures again.")
++
++        next_url = str(request.POST.get("next") or "").strip()
++        if not next_url.startswith("/") or next_url.startswith("//"):
++            next_url = reverse("admin:core_snapshot_changelist")
++        return redirect(next_url)
++
++
+ class HealthCheckView(View):
+     """
+     A Django view that renders plain text "OK" for service discovery tools
+diff --git a/archivebox/templates/admin/base.html b/archivebox/templates/admin/base.html
+index a79d4fd1c..6e7d1a3e5 100644
+--- a/archivebox/templates/admin/base.html
++++ b/archivebox/templates/admin/base.html
+@@ -1845,6 +1845,8 @@
+                 {% endif %}
+             {% endblock messages %}
+ 
++            {% include "admin/user_scope_banner.html" %}
++
+             <div id="content" class="{% block coltype %}colM{% endblock %}">
+                 {% block pretitle %}{% endblock %}
+                 {% block content_title %}{# {% if title %}<h1>{{ title }}</h1>{% endif %} #}{% endblock %}
+diff --git a/archivebox/templates/admin/user_scope_banner.html b/archivebox/templates/admin/user_scope_banner.html
+new file mode 100644
+index 000000000..a255e303d
+--- /dev/null
++++ b/archivebox/templates/admin/user_scope_banner.html
+@@ -0,0 +1,24 @@
++{% if USER_SCOPE.can_see_all or USER_SCOPE.enabled %}
++<div id="user-scope-banner" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 14px;padding:9px 14px;border-radius:10px;border:1px solid {% if USER_SCOPE.see_all %}#f59e0b{% else %}#cbd5e1{% endif %};background:{% if USER_SCOPE.see_all %}#fffbeb{% else %}#f8fafc{% endif %};color:#0f172a;font-size:13px;">
++    {% if USER_SCOPE.see_all %}
++        <strong>Every user's captures are visible.</strong>
++        <span>Per-user isolation is switched off for this session until you switch it back.</span>
++    {% else %}
++        <strong>Showing only your captures.</strong>
++        <span>Tag <code style="background:#e2e8f0;padding:1px 5px;border-radius:4px;">{{ USER_SCOPE.tag }}</code> &middot; other users' items are not listed, searched or openable by URL.</span>
++    {% endif %}
++    {% if USER_SCOPE.can_see_all %}
++        <form method="post" action="{% url 'user-scope-see-all' %}" style="margin:0 0 0 auto;">
++            {% csrf_token %}
++            <input type="hidden" name="next" value="{{ request.get_full_path }}">
++            {% if USER_SCOPE.see_all %}
++                <input type="hidden" name="see_all" value="0">
++                <button type="submit" style="cursor:pointer;padding:4px 10px;border-radius:7px;border:1px solid #cbd5e1;background:#fff;font-size:12px;font-weight:600;">Back to only mine</button>
++            {% else %}
++                <input type="hidden" name="see_all" value="1">
++                <button type="submit" style="cursor:pointer;padding:4px 10px;border-radius:7px;border:1px solid #cbd5e1;background:#fff;font-size:12px;font-weight:600;">See every user</button>
++            {% endif %}
++        </form>
++    {% endif %}
++</div>
++{% endif %}
+-- 
+2.53.0
+

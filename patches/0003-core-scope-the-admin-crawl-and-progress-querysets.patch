@@ -1,0 +1,450 @@
+From dbad59e33050939d90f150270ba4314f0dafc86d Mon Sep 17 00:00:00 2001
+From: homelab <homelab@emrys.dev>
+Date: Thu, 26 Nov 2026 02:56:29 -0600
+Subject: [PATCH 3/7] core: scope the admin, crawl and progress querysets
+
+get_queryset() on the snapshot, archive-result, crawl and schedule admins
+carries the same forced filter as the views, which covers the changelist,
+its search, its filters and every bulk action. A change-form id that is out
+of scope answers 404 rather than the admin's "does not exist" redirect, and
+custom admin views resolve through the scoped queryset.
+
+ONLY_NEW de-duplication becomes per owner: another user's capture of a URL
+must not make your add a no-op. Tag cards, counts and exports are scoped
+for the same reason a shared tag is on everyone's captures.
+---
+ archivebox/core/admin_archiveresults.py | 18 +++++++-
+ archivebox/core/admin_snapshots.py      | 56 ++++++++++++++++++++++---
+ archivebox/core/admin_tags.py           | 26 ++++++++++--
+ archivebox/crawls/admin.py              | 17 ++++----
+ archivebox/crawls/models.py             | 16 ++++---
+ archivebox/progressmonitor/views.py     | 16 +++++--
+ archivebox/search/views.py              |  4 +-
+ 7 files changed, 123 insertions(+), 30 deletions(-)
+
+diff --git a/archivebox/core/admin_archiveresults.py b/archivebox/core/admin_archiveresults.py
+index ab3e5b81f..32e427c36 100644
+--- a/archivebox/core/admin_archiveresults.py
++++ b/archivebox/core/admin_archiveresults.py
+@@ -571,7 +571,9 @@ class ArchiveResultAdmin(BaseModelAdmin):
+             try:
+                 queryset = self.get_queryset(request).filter(pk__in=selected)
+                 if not queryset.exists():
+-                    snapshot = Snapshot.objects.filter(pk=request.GET.get("snapshot")).first()
++                    from archivebox.core.user_scope import scoped_snapshot_queryset
++
++                    snapshot = scoped_snapshot_queryset(request, Snapshot.objects.all()).filter(pk=request.GET.get("snapshot")).first()
+                     return redirect(build_snapshot_detail_url(snapshot.archive_path_from_db, request=request) if snapshot else request.path)
+             except (ValidationError, ValueError):
+                 return redirect(request.path)
+@@ -584,7 +586,9 @@ class ArchiveResultAdmin(BaseModelAdmin):
+             request.GET.clear()
+             request.META["QUERY_STRING"] = ""
+             try:
+-                handoff_snapshot = Snapshot.objects.filter(pk=handoff_snapshot).first()
++                from archivebox.core.user_scope import scoped_snapshot_queryset
++
++                handoff_snapshot = scoped_snapshot_queryset(request, Snapshot.objects.all()).filter(pk=handoff_snapshot).first()
+             except (ValidationError, ValueError):
+                 handoff_snapshot = None
+         saved_list_per_page = self.list_per_page
+@@ -604,6 +608,16 @@ class ArchiveResultAdmin(BaseModelAdmin):
+             self.list_per_page = saved_list_per_page
+ 
+     def get_queryset(self, request):
++        # Same forced scope as the snapshot changelist: an archive result is visible
++        # only when its snapshot belongs to the requesting user.
++        return self._scoped_queryset(request)
++
++    def _scoped_queryset(self, request):
++        from archivebox.core.user_scope import scoped_archiveresult_queryset
++
++        return scoped_archiveresult_queryset(request, self._unscoped_queryset(request))
++
++    def _unscoped_queryset(self, request):
+         ordering = request.GET.get("o")
+         ordering_fields = set()
+         if ordering:
+diff --git a/archivebox/core/admin_snapshots.py b/archivebox/core/admin_snapshots.py
+index 2e551da93..80788cbe7 100644
+--- a/archivebox/core/admin_snapshots.py
++++ b/archivebox/core/admin_snapshots.py
+@@ -6,7 +6,7 @@ from html import escape
+ from typing import Any
+ 
+ from django.contrib import admin, messages
+-from django.core.exceptions import PermissionDenied
++from django.core.exceptions import PermissionDenied, ValidationError
+ from django.urls import path, reverse
+ from django.shortcuts import get_object_or_404, redirect
+ from django.http import JsonResponse, HttpResponseBadRequest, HttpResponseNotAllowed, Http404
+@@ -36,6 +36,11 @@ from archivebox.core.routes_util import (
+     get_snapshot_output_anchor,
+ )
+ from archivebox.core.tag_util import get_or_create_tag
++from archivebox.core.user_scope import (
++    filter_assignable_tag_names,
++    is_user_tag,
++    scoped_snapshot_queryset,
++)
+ from archivebox.core.templatetags.core_tags import snapshot_thumbnail, snapshot_url_text
+ from archivebox.plugins.hooks import discover_hooks
+ from archivebox.plugins.discovery import get_plugin_icon, get_plugin_icon_sprite, get_plugin_list_icon, get_snapshot_role_names
+@@ -606,7 +611,9 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
+ 
+     def preview_view(self, request, object_id, plugin, filename):
+         """Serve a saved image output from the authenticated admin origin."""
+-        snapshot = get_object_or_404(Snapshot, pk=object_id)
++        # Scoped, not a bare pk lookup: these are custom admin URLs outside the
++        # changelist and would otherwise reach another user's snapshot by id.
++        snapshot = get_object_or_404(scoped_snapshot_queryset(request, Snapshot.objects.all()), pk=object_id)
+         if not self.has_view_or_change_permission(request, snapshot):
+             raise PermissionDenied
+         result = snapshot.archiveresult_set.filter(plugin=plugin, status=ArchiveResult.StatusChoices.SUCCEEDED).first()
+@@ -635,7 +642,9 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
+         if permissions not in dict(PERMISSIONS_CHOICES):
+             return HttpResponseBadRequest("Invalid permissions value")
+ 
+-        snapshot = get_object_or_404(Snapshot, pk=object_id)
++        # Scoped, not a bare pk lookup: these are custom admin URLs outside the
++        # changelist and would otherwise reach another user's snapshot by id.
++        snapshot = get_object_or_404(scoped_snapshot_queryset(request, Snapshot.objects.all()), pk=object_id)
+         config = dict(snapshot.config or {})
+         config["PERMISSIONS"] = permissions
+ 
+@@ -677,7 +686,9 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
+         return updated
+ 
+     def redo_failed_view(self, request, object_id):
+-        snapshot = get_object_or_404(Snapshot, pk=object_id)
++        # Scoped, not a bare pk lookup: these are custom admin URLs outside the
++        # changelist and would otherwise reach another user's snapshot by id.
++        snapshot = get_object_or_404(scoped_snapshot_queryset(request, Snapshot.objects.all()), pk=object_id)
+ 
+         if request.method == "POST":
+             retried = snapshot.retry_failed_archiveresults()
+@@ -694,6 +705,25 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
+ 
+         return redirect(snapshot.admin_change_url)
+ 
++    def get_object(self, request, object_id, from_field=None):
++        """404 for a snapshot that exists but belongs to another user.
++
++        Django's default answer for an object outside ``get_queryset()`` is a
++        redirect to the changelist ("does not exist"). That is indistinguishable
++        from a bad id, but the contract here is that a direct URL to a snapshot
++        that is not yours answers 404 - the same as one that does not exist - so
++        the row's existence never leaks through a status code.
++        """
++        obj = super().get_object(request, object_id, from_field)
++        if obj is None and object_id:
++            try:
++                exists = Snapshot.objects.filter(pk=object_id).exists()
++            except (ValidationError, ValueError, TypeError):
++                exists = False
++            if exists:
++                raise Http404("Snapshot not found")
++        return obj
++
+     def get_queryset(self, request):
+         self.request = request
+         ordering_fields = self._get_ordering_fields(request)
+@@ -731,6 +761,10 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
+             )
+ 
+         qs = super().get_queryset(request)
++        # THE FORCED FILTER, SERVER-SIDE. This is the snapshot changelist, its search,
++        # its filters, the change form (a foreign snapshot raises 404 here) and every
++        # bulk action that operates on the queryset - one place, no query parameter.
++        qs = scoped_snapshot_queryset(request, qs)
+         if is_change_view:
+             qs = qs.select_related("crawl__created_by").defer("notes")
+         else:
+@@ -1470,7 +1504,9 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
+         # on the resulting crawl so existing snapshots don't cause the crawl to
+         # seal immediately with zero new snapshots (the default ONLY_NEW=True
+         # would skip any URLs that have ever been archived before).
+-        crawl, _ = add(urls=urls, bg=True, config={"ONLY_NEW": False})
++        # Attribute the new crawl to the operator who asked for it: the crawl's
++        # created_by is what stamps user-<name> on the snapshots it creates.
++        crawl, _ = add(urls=urls, bg=True, config={"ONLY_NEW": False}, created_by_id=request.user.pk)
+ 
+         messages.success(
+             request,
+@@ -1519,6 +1555,16 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
+             return
+ 
+         tag_names = [name.strip() for name in tags_str.split(",") if name.strip()]
++        reserved = [name for name in tag_names if is_user_tag(name)]
++        tag_names = filter_assignable_tag_names(tag_names)
++        if reserved:
++            messages.warning(
++                request,
++                f"Ignored reserved ownership tag(s): {', '.join(reserved)}. They are assigned automatically.",
++            )
++        if not tag_names:
++            messages.warning(request, "No tags specified.")
++            return
+         tags = []
+         for name in tag_names:
+             tag, _ = get_or_create_tag(
+diff --git a/archivebox/core/admin_tags.py b/archivebox/core/admin_tags.py
+index f84552ed5..8bdc14c67 100644
+--- a/archivebox/core/admin_tags.py
++++ b/archivebox/core/admin_tags.py
+@@ -13,7 +13,8 @@ from django.utils.html import format_html
+ from django.utils.safestring import mark_safe
+ 
+ from archivebox.base_models.admin import BaseModelAdmin
+-from archivebox.core.models import ArchiveResult, SnapshotTag, Tag
++from archivebox.core.models import ArchiveResult, Snapshot, SnapshotTag, Tag
++from archivebox.core.user_scope import scoped_snapshot_queryset
+ from archivebox.core.tag_util import (
+     TAG_HAS_SNAPSHOTS_CHOICES,
+     TAG_SORT_CHOICES,
+@@ -53,9 +54,15 @@ class TagAdminForm(forms.ModelForm):
+         }
+ 
+     def clean_name(self):
++        from archivebox.core.user_scope import is_user_tag
++
+         name = (self.cleaned_data.get("name") or "").strip()
+         if not name:
+             raise forms.ValidationError("Tag name is required.")
++        if is_user_tag(name):
++            # Ownership tags are written at capture time and hidden everywhere; a
++            # hand-made one would either be inert or name another user's collection.
++            raise forms.ValidationError('Tags starting with "user-" are reserved for per-user ownership.')
+         return name
+ 
+ 
+@@ -111,10 +118,17 @@ class TagAdmin(BaseModelAdmin):
+         ),
+     )
+ 
++    def get_queryset(self, request: HttpRequest):
++        # The default manager already excludes user-* ownership tags; keep the
++        # request so the per-tag snapshot cards can apply the ownership scope.
++        self.request = request
++        return super().get_queryset(request)
++
+     def get_fieldsets(self, request: HttpRequest, obj: Tag | None = None):
+         return self.fieldsets if obj else self.add_fieldsets
+ 
+     def changelist_view(self, request: HttpRequest, extra_context=None):
++        self.request = request
+         query = (request.GET.get("q") or "").strip()
+         sort = normalize_tag_sort((request.GET.get("sort") or "created_desc").strip())
+         created_by = normalize_created_by_filter((request.GET.get("created_by") or "").strip())
+@@ -150,6 +164,7 @@ class TagAdmin(BaseModelAdmin):
+         return TemplateResponse(request, self.change_list_template, context)
+ 
+     def render_change_form(self, request, context, add=False, change=False, form_url="", obj=None):
++        self.request = request
+         current_name = (request.POST.get("name") or "").strip()
+         if not current_name and obj:
+             current_name = obj.name
+@@ -193,8 +208,11 @@ class TagAdmin(BaseModelAdmin):
+ 
+     @admin.display(description="Snapshots")
+     def snapshots(self, tag: Tag):
++        # The recent-snapshot cards on a tag page are the requester's snapshots: a
++        # shared tag is on every user's captures, and these cards show URLs/titles.
+         snapshots = (
+-            tag.snapshot_set.select_related("crawl__created_by")
++            scoped_snapshot_queryset(getattr(self, "request", None), tag.snapshot_set.all())
++            .select_related("crawl__created_by")
+             .prefetch_related(
+                 Prefetch(
+                     "archiveresult_set",
+@@ -213,7 +231,7 @@ class TagAdmin(BaseModelAdmin):
+             )
+             .order_by("-downloaded_at", "-created_at", "-pk")[:10]
+         )
+-        total_count = tag.snapshot_set.count()
++        total_count = scoped_snapshot_queryset(getattr(self, "request", None), tag.snapshot_set.all()).count()
+         if not snapshots:
+             return mark_safe(
+                 f'<p style="margin:0;color:#64748b;">No snapshots use this tag yet. '
+@@ -259,7 +277,7 @@ class TagAdmin(BaseModelAdmin):
+     def num_snapshots(self, tag: Tag):
+         count = tag.__dict__.get("num_snapshots")
+         if count is None:
+-            count = tag.snapshot_set.count()
++            count = scoped_snapshot_queryset(getattr(self, "request", None), tag.snapshot_set.all()).count()
+         return format_html(
+             '<a href="/admin/core/snapshot/?tags__id__exact={}">{} total</a>',
+             tag.id,
+diff --git a/archivebox/crawls/admin.py b/archivebox/crawls/admin.py
+index 33433f44f..f551d2e00 100644
+--- a/archivebox/crawls/admin.py
++++ b/archivebox/crawls/admin.py
+@@ -31,6 +31,7 @@ from archivebox.core.permissions import (
+     normalize_permissions,
+ )
+ from archivebox.core.routes_util import build_snapshot_detail_url, build_snapshot_role_output_url
++from archivebox.core.user_scope import scoped_crawl_queryset, scoped_snapshot_queryset
+ from archivebox.core.widgets import TagEditorWidget, URLFiltersWidget
+ from archivebox.crawls.models import Crawl, CrawlSchedule
+ from archivebox.misc.paginators import AcceleratedPaginator
+@@ -788,8 +789,7 @@ class CrawlAdmin(ConfigEditorMixin, BaseModelAdmin):
+     def get_queryset(self, request):
+         """Keep joins page-local while computing per-row snapshot counts in the page query."""
+         queryset = (
+-            super()
+-            .get_queryset(request)
++            scoped_crawl_queryset(request, super().get_queryset(request))
+             .prefetch_related(
+                 "created_by",
+                 "persona",
+@@ -1156,8 +1156,8 @@ class CrawlAdmin(ConfigEditorMixin, BaseModelAdmin):
+         if request.method != "POST":
+             return HttpResponseNotAllowed(["POST"])
+ 
+-        crawl = get_object_or_404(Crawl, pk=object_id)
+-        snapshot = get_object_or_404(Snapshot, pk=snapshot_id, crawl=crawl)
++        crawl = get_object_or_404(scoped_crawl_queryset(request, Crawl.objects.all()), pk=object_id)
++        snapshot = get_object_or_404(scoped_snapshot_queryset(request, Snapshot.objects.all()), pk=snapshot_id, crawl=crawl)
+ 
+         if snapshot.status == Snapshot.StatusChoices.STARTED:
+             snapshot.cancel_running_hooks()
+@@ -1176,8 +1176,8 @@ class CrawlAdmin(ConfigEditorMixin, BaseModelAdmin):
+         if request.method != "POST":
+             return HttpResponseNotAllowed(["POST"])
+ 
+-        crawl = get_object_or_404(Crawl, pk=object_id)
+-        snapshot = get_object_or_404(Snapshot, pk=snapshot_id, crawl=crawl)
++        crawl = get_object_or_404(scoped_crawl_queryset(request, Crawl.objects.all()), pk=object_id)
++        snapshot = get_object_or_404(scoped_snapshot_queryset(request, Snapshot.objects.all()), pk=snapshot_id, crawl=crawl)
+         result = crawl.exclude_domain(snapshot.url)
+         return JsonResponse(
+             {
+@@ -1194,7 +1194,7 @@ class CrawlAdmin(ConfigEditorMixin, BaseModelAdmin):
+         if permissions not in PERMISSIONS_VALUES:
+             return HttpResponseBadRequest("Invalid permissions value")
+ 
+-        crawl = get_object_or_404(Crawl, pk=object_id)
++        crawl = get_object_or_404(scoped_crawl_queryset(request, Crawl.objects.all()), pk=object_id)
+         self.update_crawl_permissions(Crawl.objects.filter(pk=crawl.pk), permissions)
+         icon, label, fg, bg = PERMISSIONS_META[permissions]
+         return JsonResponse({"permissions": permissions, "icon": icon, "label": label, "fg": fg, "bg": bg})
+@@ -1297,8 +1297,7 @@ class CrawlScheduleAdmin(BaseModelAdmin):
+     def get_queryset(self, request):
+         self.request = request
+         return (
+-            super()
+-            .get_queryset(request)
++            scoped_crawl_queryset(request, super().get_queryset(request))
+             .select_related("created_by", "template")
+             .annotate(
+                 crawl_count=Count("crawl", distinct=True),
+diff --git a/archivebox/crawls/models.py b/archivebox/crawls/models.py
+index c16cdc79b..c7c17f22e 100755
+--- a/archivebox/crawls/models.py
++++ b/archivebox/crawls/models.py
+@@ -942,6 +942,7 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
+             List of newly created Snapshot objects
+         """
+         from archivebox.core.models import Snapshot, Tag
++        from archivebox.core.user_scope import crawl_owner_username, owned_snapshot_queryset
+         from archivebox.config.common import get_config
+ 
+         if self.status == self.StatusChoices.SEALED:
+@@ -949,6 +950,7 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
+         created_snapshots = []
+         tags_by_name: dict[str, Tag] = {}
+         server_config = get_config()
++        owner_username = crawl_owner_username(self)
+ 
+         for line in self.urls.splitlines():
+             if not line.strip():
+@@ -989,7 +991,10 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
+             # still deduplicates discovered children and ordinary adds.
+             refresh_scheduled_seed = self.schedule_id is not None and self.max_depth > 0 and depth == 0
+             # /über and /%C3%BCber are one URL: dedupe across both spellings.
+-            if only_new_urls and not refresh_scheduled_seed and Snapshot.objects.filter(url__in=equivalent_urls(url)).exists():
++            # ONLY_NEW is per owner: another user's capture of the same URL must not
++            # make this add a no-op, or a second user could never archive a URL the
++            # first one already had.
++            if only_new_urls and not refresh_scheduled_seed and owned_snapshot_queryset(owner_username, Snapshot.objects).filter(url__in=equivalent_urls(url)).exists():
+                 continue
+ 
+             # Skip if depth exceeds max_depth
+@@ -1095,6 +1100,7 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
+     ) -> list["Snapshot"]:
+         """Create child snapshots from discovered URL records after filtering and deduping once."""
+         from archivebox.core.models import Snapshot, SnapshotTag, Tag
++        from archivebox.core.user_scope import crawl_owner_username, filter_assignable_tag_names, owned_snapshot_queryset
+         from archivebox.config.common import get_config
+ 
+         if self.status == self.StatusChoices.SEALED:
+@@ -1166,12 +1172,12 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
+                 update_fields.append("bookmarked_at")
+             if update_fields:
+                 snapshot.save(update_fields=[*update_fields, "modified_at"])
+-            tag_names = {
+-                *self.parse_tag_names(
++            tag_names = filter_assignable_tag_names(
++                self.parse_tag_names(
+                     str(record.get("tags") or ""),
+                     pattern=self._config_value(config, "TAG_SEPARATOR_PATTERN", r"[,]"),
+                 ),
+-            }
++            )
+             if tag_names:
+                 tag_ids = [Tag.get_or_create_by_name(tag_name)[0].pk for tag_name in tag_names]
+                 snapshot.add_tag_ids(tag_ids)
+@@ -1180,7 +1186,7 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
+         # Child discoveries must retain global ONLY_NEW even in scheduled crawls.
+         refresh_scheduled_seed = self.schedule_id is not None and self.max_depth > 0 and parent_snapshot is None and depth == 0
+         only_new_urls = bool(self._config_value(config, "ONLY_NEW", True)) and not refresh_scheduled_seed
+-        existing_scope = Snapshot.objects if only_new_urls else self.snapshot_set
++        existing_scope = owned_snapshot_queryset(crawl_owner_username(self), Snapshot.objects) if only_new_urls else self.snapshot_set
+         existing_uris = {iri_to_uri(url) for url in existing_scope.filter(url__in=lookup_urls).values_list("url", flat=True)}
+         urls = [url for url in deduped_records.keys() if iri_to_uri(url) not in existing_uris]
+         remaining = self.remaining_snapshot_capacity()
+diff --git a/archivebox/progressmonitor/views.py b/archivebox/progressmonitor/views.py
+index ebbc1be87..782a7b7ad 100644
+--- a/archivebox/progressmonitor/views.py
++++ b/archivebox/progressmonitor/views.py
+@@ -137,10 +137,18 @@ def live_progress_view(request, *, authorized_snapshot=None):
+         crawl_scope = Crawl.objects.all()
+         snapshot_scope = Snapshot.objects.all()
+         archiveresult_scope = ArchiveResult.objects.all()
+-        if is_admin and not request.user.is_superuser:
+-            crawl_scope = crawl_scope.filter(created_by=request.user)
+-            snapshot_scope = snapshot_scope.filter(crawl__created_by=request.user)
+-            archiveresult_scope = archiveresult_scope.filter(snapshot__crawl__created_by=request.user)
++        # Per-user isolation applies to the header counters as well: the same forced
++        # scope as every list, widened only by the superuser's deliberate see-all.
++        if request.user.is_authenticated:
++            from archivebox.core.user_scope import (
++                scoped_archiveresult_queryset,
++                scoped_crawl_queryset,
++                scoped_snapshot_queryset,
++            )
++
++            crawl_scope = scoped_crawl_queryset(request, crawl_scope)
++            snapshot_scope = scoped_snapshot_queryset(request, snapshot_scope)
++            archiveresult_scope = scoped_archiveresult_queryset(request, archiveresult_scope)
+         # Header badges (queued, active, workers, throughput) always describe the
+         # admin's whole collection; only the tree below follows the page's scope.
+         # Guests on a public snapshot page only ever see that snapshot.
+diff --git a/archivebox/search/views.py b/archivebox/search/views.py
+index 0e43b231c..649e5638d 100644
+--- a/archivebox/search/views.py
++++ b/archivebox/search/views.py
+@@ -403,7 +403,9 @@ def public_snapshot_search_stream_view(request):
+     query = (request.GET.get("q") or "").strip()
+     search_mode = get_search_mode(request.GET.get("search_mode"), config=config)
+     search_url = request.GET.get("search_url") or request.get_full_path()
+-    base_queryset = public_snapshots_queryset(Snapshot.objects.all())
++    # Ownership first: the stream may only publish IDs the request could already
++    # see, so a cached result set cannot widen a later page.
++    base_queryset = public_snapshots_queryset(Snapshot.objects.all(), request=request)
+ 
+     return snapshot_search_stream_response(
+         query,
+-- 
+2.53.0
+
