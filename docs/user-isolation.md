@@ -1,0 +1,125 @@
+# Per-user isolation
+
+Every capture belongs to exactly one user. There is no shared collection and no
+"everyone can see this" mode: a snapshot is visible to the user whose
+`user-<username>` tag it carries, and to nobody else. An untagged snapshot is
+visible to nobody.
+
+This is a fork-specific feature (`homelab` branch, see
+`patches/archivebox/README.md` in the homelab repository). It is enforced on the
+server, not in the browser.
+
+## The ownership tag
+
+`core_snapshot` has no owner column, so ownership is a tag in the existing
+`core_tag` / `core_snapshot_tags` tables:
+
+| | |
+|---|---|
+| name | `user-<username>` (the Django `User.username`, i.e. the LLDAP uid from the reverse-proxy header) |
+| written | once, when the snapshot row is created |
+| rewritten | never - a tag edit, re-crawl, import or admin action preserves it |
+| visible | nowhere in the UI or API (see below) |
+| queried | by the server for every read path |
+
+One tag per snapshot, not a set: a snapshot with two owners would be visible to
+both, which is the thing this feature exists to prevent.
+
+## Who owns a new capture
+
+Resolved once at creation, in this order:
+
+1. **The crawl's `created_by`.** The web add form sets it to the session user;
+   the API sets it to the *API token's owner*; a scheduled crawl copies its
+   template's owner. This is the normal path for every UI and API add.
+2. **`ARCHIVEBOX_ADD_USER`** (or `archivebox add --user <name>`), for adds with
+   no authenticated user: a pod shell, a `kubectl exec`, a cron.
+3. **The parent snapshot's owner**, for links discovered while crawling.
+4. **Nobody.** The snapshot is left untagged and is therefore invisible. The CLI
+   refuses to create work in this state (`resolve_created_by_id` raises) rather
+   than producing captures nobody can see.
+
+The API is the important case: `archivebox/api/auth.py` resolves a bearer token to
+`APIToken.created_by`, django-ninja puts that user on `request.user`, and
+`POST /api/v1/core/snapshots` creates the crawl with `created_by=request.user`. A
+token minted by user A therefore attributes A's ingestion to A - not to whoever
+else might be logged in, and not to the site admin.
+
+## What is enforced, and where
+
+| Surface | Hook |
+| --- | --- |
+| snapshot changelist, its search, filters and bulk actions | `SnapshotAdmin.get_queryset` |
+| snapshot change form (a foreign id is 404) | same queryset |
+| admin custom views (`redo_failed`, delete/exclude/set-permissions) | `scoped_snapshot_queryset` around `get_object_or_404` |
+| archive-result changelist | `ArchiveResultAdmin.get_queryset` |
+| crawl + schedule changelists, per-crawl snapshot actions | `scoped_crawl_queryset`, `scoped_snapshot_queryset` |
+| tag index, tag cards, tag counts, tag exports | `build_tag_cards(..., request=...)`, `Tag` default manager |
+| public index and public search | `public_snapshots_queryset(qs, request=...)` |
+| direct snapshot URLs (`/<user>/<date>/<domain>/<uuid>/`, `/snapshot/<id>`, replay hosts) | `require_snapshot_access` -> **404** |
+| `can_view_snapshot` (used by every remaining view) | ownership check before the permissions check |
+| `GET /api/v1/core/snapshots`, `.rss`, `/snapshot/<id>`, `/archiveresults`, `/crawls`, `/crawl/<id>` | `scoped_*_queryset` in the endpoint |
+| `/api/v1/cli/{search,update,remove}` | scoped queryset / `snapshot_scope` |
+| progress counters (`/progress.json`) | scoped aggregates |
+
+A snapshot that is not yours answers **404**, not 403 and not a login redirect:
+the same answer as one that does not exist. `/web/<url>` and the memento timegate
+resolve through `discoverable_snapshots_queryset`, so they cannot be used to
+discover a URL that is not yours either.
+
+Nothing is filtered client-side, and no query parameter widens a scope. There is
+exactly one way to see other users' captures:
+
+## `see_all` (superusers, deliberate, POST-only)
+
+`POST /user-scope/see-all/` with `see_all=1` sets a session flag; `see_all=0`
+clears it. Only an active superuser may call it, only as a form POST, and the
+admin banner says so for as long as it is on. There is no GET form and no query
+parameter. Being a superuser without the flag changes nothing: the operator's own
+view is the same as every other user's, which is the point - if the operator's
+view were exempt, isolation bugs would never be seen by the only person who could
+fix them.
+
+## `user-*` tags are internal
+
+A custom default manager on `Tag` excludes names starting with `user-`. Every tag
+index, autocomplete, picker, inline, snapshot card, JSONL export and API response
+goes through that manager, so those tags are invisible in all of them at once
+rather than by a template-by-template opt-out. `Tag.all_objects` is the
+unfiltered manager, used only by `core/user_scope.py` and the backfill migration.
+
+Creating a `user-*` tag by hand is refused (`Tag.get_or_create_by_name`,
+`TagAdminForm.clean_name`, and therefore every form, API and import that reaches
+them), because a hand-made one would either be inert or name another user's
+collection.
+
+## Existing snapshots
+
+Migration `core.0061_user_scope_backfill` tags every snapshot that has no
+ownership tag as `user-myrddin`, and raises rather than finishing if it cannot
+(the alternative is an archive that silently disappears). It runs inside
+`archivebox server --init`, once, and prints what it did:
+
+```
+user_scope backfill: 3 snapshot(s) in the collection; 3 tagged as user-myrddin by this migration, 0 already carried it, 0 left untagged (tag created)
+```
+
+A rollback of the image leaves the tags in place; the older code does not read
+them. A rollback of the migration is a no-op on purpose - stripping ownership
+would hide the archive.
+
+## Known limits
+
+* A snapshot's *files* live under `<archive>/<username>/<date>/<domain>/<uuid>/`
+  and are only served through a view that checks ownership. Anyone with a shell in
+  the pod (or read access to the CephFS volume) can read the archive directly;
+  this feature is about the web UI and API, not about storage encryption.
+* JSONL `/api/v1/cli/*` exports carry the visible tags only, so ownership is not
+  round-tripped through an export/import. Restore from the backup (postgres/volume
+  snapshot) to preserve it.
+* `APIToken` administration stays a superuser surface: minting a token for another
+  user is how that user gets API attribution in the first place.
+* Tag deletion of an ownership tag is refused through the API and admin (it is
+  invisible there); a direct SQL delete would make that snapshot invisible, and
+  `core.0061` will not re-run. Re-assign with
+  `manage.py shell -c "..."` if it ever happens.
