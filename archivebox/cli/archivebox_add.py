@@ -69,9 +69,15 @@ def add(
     index_only: bool = False,
     bg: bool = False,
     created_by_id: int | None = None,
+    user: str = "",
     config: dict[str, Any] | None = None,
 ) -> tuple[Crawl, QuerySet[Snapshot]]:
-    """Add a URL list or imported URL document to a new Crawl."""
+    """Add a URL list or imported URL document to a new Crawl.
+
+    ``user`` (or ``ARCHIVEBOX_ADD_USER``) names the owner of the resulting
+    ``user-<name>`` tags when the caller has no authenticated user. An add with
+    neither is refused: an unattributed crawl's snapshots would be invisible.
+    """
 
     from rich import print
 
@@ -105,14 +111,16 @@ def add(
 
     # import models once django is set up
     from archivebox.crawls.models import Crawl
-    from archivebox.base_models.models import get_or_create_system_user_pk
     from archivebox.personas.models import Persona
     from archivebox.misc.logging_util import printable_filesize
     from archivebox.misc.system import get_dir_size
     from archivebox.core.shutdown_util import foreground_parent_watchdog, foreground_shutdown_signals
     from django.utils import timezone
 
-    created_by_id = created_by_id or get_or_create_system_user_pk()
+    # Owner of the crawl, and therefore of every user-<name> tag its snapshots get.
+    from archivebox.core.user_scope import resolve_created_by_id
+
+    created_by_id = resolve_created_by_id(created_by_id, username=user)
     started_at = timezone.now()
 
     if isinstance(urls, str):
@@ -357,6 +365,13 @@ def add(
 @click.option("--plugins", "-p", default="", help="Comma-separated list of plugins to run e.g. title,favicon,screenshot,singlefile,...")
 @click.option("--extract", default="", help="Comma-separated plugins or output types to extract e.g. title,pdf,text/html,image,...")
 @click.option("--persona", default="Default", help="Authentication profile to use when archiving")
+@click.option(
+    "--user",
+    "user",
+    default="",
+    help="Owner of the added snapshots (recorded as a user-<name> tag). Defaults to ARCHIVEBOX_ADD_USER; "
+    "an add with neither is refused, because untagged snapshots are invisible to everyone.",
+)
 @click.option(
     "--only-new/--no-only-new",
     "only_new",

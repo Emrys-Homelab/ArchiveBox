@@ -51,6 +51,7 @@ def _get_search_indexing_plugins() -> list[str]:
 
 
 def _build_filtered_snapshots_queryset(
+    snapshot_scope=None,
     **kwargs,
 ):
     from archivebox.cli.archivebox_snapshot import build_snapshot_queryset
@@ -58,6 +59,10 @@ def _build_filtered_snapshots_queryset(
     limit = kwargs.pop("limit", None)
     reverse = kwargs.pop("reverse", False)
     snapshots = build_snapshot_queryset(**kwargs)
+    if snapshot_scope is not None:
+        # Per-user isolation: a filtered update can only reach the snapshots the
+        # caller may already see. Used by POST /api/v1/cli/update.
+        snapshots = snapshots.filter(pk__in=snapshot_scope.values("pk"))
     snapshots = snapshots.order_by(kwargs.get("sort") or "-created_at", "-id")
     if reverse:
         snapshots = snapshots.reverse()
@@ -168,6 +173,7 @@ def update(
     rescan: bool = False,
     reverse: bool = False,
     stop_daemon_stack: bool = True,
+    snapshot_scope: QuerySet[Snapshot, Snapshot] | None = None,
 ) -> None:
     """
     Update the database without forcing a filesystem scan by default.
@@ -266,6 +272,7 @@ def update(
 
                     if is_filtered_update:
                         snapshots = _build_filtered_snapshots_queryset(
+                            snapshot_scope=snapshot_scope,
                             filter_patterns=filter_patterns,
                             filter_type=filter_type,
                             status=status,
@@ -360,6 +367,7 @@ def update(
                     from archivebox.cli.rescan import reconcile_known_snapshots
 
                     snapshots = _build_filtered_snapshots_queryset(
+                        snapshot_scope=snapshot_scope,
                         filter_patterns=filter_patterns,
                         filter_type=filter_type,
                         status=status,
@@ -381,6 +389,7 @@ def update(
                         print("[*] No search indexing plugins are available, nothing to backfill.")
                     else:
                         snapshots = _build_filtered_snapshots_queryset(
+                            snapshot_scope=snapshot_scope,
                             filter_patterns=filter_patterns,
                             filter_type=filter_type,
                             status=status,

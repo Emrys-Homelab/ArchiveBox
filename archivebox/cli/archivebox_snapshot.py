@@ -125,11 +125,14 @@ def create_snapshots(
         TYPE_CRAWL,
     )
     from archivebox.misc.util import validate_url
-    from archivebox.base_models.models import get_or_create_system_user_pk
     from archivebox.core.models import Snapshot
     from archivebox.crawls.models import Crawl
 
-    created_by_id = created_by_id or get_or_create_system_user_pk()
+    # An explicit owner is required: these commands create work whose snapshots are
+    # tagged user-<name>, and an unattributed add would be invisible to everyone.
+    from archivebox.core.user_scope import resolve_created_by_id
+
+    created_by_id = resolve_created_by_id(created_by_id)
     is_tty = sys.stdout.isatty()
 
     # Collect all input records
